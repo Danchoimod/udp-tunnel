@@ -6,8 +6,7 @@ const { encodeMessage, createLineParser } = require("./common/protocol");
 
 function loadConfig(configPath) {
   const resolvedPath = path.resolve(process.cwd(), configPath);
-  const raw = fs.readFileSync(resolvedPath, "utf8");
-  return JSON.parse(raw);
+  return JSON.parse(fs.readFileSync(resolvedPath, "utf8"));
 }
 
 function startAgent(config) {
@@ -17,6 +16,7 @@ function startAgent(config) {
 
   const localSocketsBySession = new Map();
   const sessionLastSeen = new Map();
+  const sessionErrorCooldown = new Map();
 
   function touchSession(sessionId) {
     sessionLastSeen.set(sessionId, Date.now());
@@ -24,164 +24,98 @@ function startAgent(config) {
 
   function closeLocalSession(sessionId) {
     const localSocket = localSocketsBySession.get(sessionId);
-    if (!localSocket) {
-      return;
-    }
-    try {
-      localSocket.close();
-    } catch (error) {
-      console.error("Error closing local UDP socket:", error.message);
-    }
+    if (!localSocket) return;
+    try { localSocket.close(); } catch (e) {}
     localSocketsBySession.delete(sessionId);
     sessionLastSeen.delete(sessionId);
   }
 
-  function getOrCreateLocalSocket(sessionId) {
+  function getOrCreateLocalSocket(sessionId, localPort) {
     let localSocket = localSocketsBySession.get(sessionId);
-    if (localSocket) {
-      return localSocket;
+    if (localSocket) return localSocket;
+
+    const lastError = sessionErrorCooldown.get(sessionId);
+    if (lastError && Date.now() - lastError < 5000) return null;
+
+    if (localSocketsBySession.size > 200) {
+      console.warn("[Agent] Too many sessions");
+      return null;
     }
 
+    const host = config.localHost || "127.0.0.1";
     localSocket = dgram.createSocket("udp4");
+    localSocket.targetPort = localPort;
+    localSocket.targetHost = host;
+
     localSocket.on("message", (payload) => {
-      if (!controlSocket || !authenticated) {
-        return;
-      }
+      if (!controlSocket || !authenticated) return;
       touchSession(sessionId);
-      controlSocket.write(
-        encodeMessage({
-          type: "UDP_FROM_LOCAL",
-          sessionId,
-          payloadBase64: payload.toString("base64"),
-        })
-      );
-    });
-    localSocket.on("error", (error) => {
-      console.error(`Local socket error (${sessionId}):`, error.message);
-      closeLocalSession(sessionId);
+      controlSocket.write(encodeMessage({
+        type: "UDP_FROM_LOCAL",
+        sessionId,
+        payloadBase64: payload.toString("base64"),
+      }));
     });
 
-    localSocket.bind(0, "0.0.0.0", () => {
-      // connect narrows packets to local minecraft service only
-      localSocket.connect(config.localUdpPort, config.localUdpHost);
+    localSocket.on("error", (error) => {
+      console.error(`[UDP ${localPort}] error:`, error.message);
+      sessionErrorCooldown.set(sessionId, Date.now());
+      closeLocalSession(sessionId);
     });
 
     localSocketsBySession.set(sessionId, localSocket);
     return localSocket;
   }
 
-  function scheduleReconnect() {
-    if (reconnectTimer) {
-      return;
-    }
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      connectControl();
-    }, config.reconnectMs || 3_000);
-  }
-
   function connectControl() {
     authenticated = false;
-
-    const socket = net.createConnection(
-      {
-        host: config.serverHost,
-        port: config.serverControlPort,
-      },
-      () => {
-        console.log("Connected to tunnel server");
-        socket.setKeepAlive(true, 20_000);
-        socket.write(
-          encodeMessage({
-            type: "AUTH",
-            token: config.authToken,
-            clientName: config.clientName || "bedrock-agent",
-          })
-        );
-      }
-    );
+    const socket = net.createConnection({
+      host: config.serverHost,
+      port: config.serverControlPort,
+    }, () => {
+      console.log("Connected to tunnel server");
+      socket.write(encodeMessage({
+        type: "AUTH",
+        token: config.authToken,
+        clientName: config.clientName || "multi-port-agent",
+      }));
+    });
 
     controlSocket = socket;
 
-    const parseChunk = createLineParser(
-      (msg) => {
-        if (!msg || typeof msg !== "object") {
-          return;
+    const parseChunk = createLineParser((msg) => {
+      if (msg.type === "AUTH_OK") { authenticated = true; console.log("Authorized"); }
+      else if (msg.type === "PING") { socket.write(encodeMessage({ type: "PONG" })); }
+      else if (msg.type === "UDP_TO_LOCAL") {
+        if (!authenticated) return;
+        const { sessionId, localPort, payloadBase64 } = msg;
+        touchSession(sessionId);
+        const localSocket = getOrCreateLocalSocket(sessionId, localPort);
+        if (localSocket) {
+          localSocket.send(Buffer.from(payloadBase64, "base64"), localSocket.targetPort, localSocket.targetHost);
         }
-
-        if (msg.type === "AUTH_OK") {
-          authenticated = true;
-          console.log("Agent authenticated");
-          return;
-        }
-
-        if (msg.type === "AUTH_FAIL") {
-          console.error("Authentication failed:", msg.reason || "unknown");
-          socket.destroy();
-          return;
-        }
-
-        if (msg.type === "PING") {
-          socket.write(encodeMessage({ type: "PONG", ts: Date.now() }));
-          return;
-        }
-
-        if (msg.type === "UDP_TO_LOCAL") {
-          if (!authenticated) {
-            return;
-          }
-          const { sessionId, payloadBase64 } = msg;
-          if (typeof sessionId !== "string" || typeof payloadBase64 !== "string") {
-            return;
-          }
-
-          touchSession(sessionId);
-          const localSocket = getOrCreateLocalSocket(sessionId);
-          const payload = Buffer.from(payloadBase64, "base64");
-          localSocket.send(payload);
-        }
-      },
-      (error) => {
-        console.error("Invalid control message:", error.message);
       }
-    );
+    }, (err) => console.error("Control error:", err.message));
 
     socket.on("data", parseChunk);
-    socket.on("error", (error) => {
-      console.error("Control socket error:", error.message);
-    });
+    socket.on("error", (err) => console.error("Control error:", err.message));
     socket.on("close", () => {
-      if (controlSocket === socket) {
-        controlSocket = null;
-        authenticated = false;
-      }
-      console.warn("Disconnected from tunnel server");
-      scheduleReconnect();
+      controlSocket = null;
+      authenticated = false;
+      console.warn("Disconnected");
+      if (!reconnectTimer) reconnectTimer = setTimeout(() => { reconnectTimer = null; connectControl(); }, 3000);
     });
   }
 
   setInterval(() => {
     const now = Date.now();
-    const staleMs = config.sessionIdleTimeoutMs || 60_000;
-    for (const [sessionId, lastSeen] of sessionLastSeen.entries()) {
-      if (now - lastSeen > staleMs) {
-        closeLocalSession(sessionId);
-      }
+    for (const [sid, last] of sessionLastSeen) {
+      if (now - last > (config.sessionIdleTimeoutMs || 60000)) closeLocalSession(sid);
     }
-  }, config.maintenanceIntervalMs || 10_000);
+  }, config.maintenanceIntervalMs || 10000);
 
   connectControl();
 }
 
-function main() {
-  const configPath = process.argv[2];
-  if (!configPath) {
-    console.error("Usage: node src/agent.js <config-path>");
-    process.exit(1);
-  }
-
-  const config = loadConfig(configPath);
-  startAgent(config);
-}
-
-main();
+const config = loadConfig(process.argv[2]);
+startAgent(config);

@@ -1,10 +1,9 @@
 {
-  "serverHost": "127.0.0.1",
+  "serverHost": "your-vps-ip-here",
   "serverControlPort": 7000,
   "authToken": "CHANGE_ME_STRONG_TOKEN",
-  "clientName": "bedrock-lan-agent",
-  "localUdpHost": "127.0.0.1",
-  "localUdpPort": 19132,
+  "clientName": "bedrock-multi-agent",
+  "localHost": "127.0.0.1",
   "reconnectMs": 3000,
   "maintenanceIntervalMs": 10000,
   "sessionIdleTimeoutMs": 60000
