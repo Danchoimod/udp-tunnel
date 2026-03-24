@@ -1,0 +1,15 @@
+{
+  "name": "tunnel_ba",
+  "version": "1.0.0",
+  "description": "UDP tunnel backend for Minecraft Bedrock inspired by frp architecture",
+  "main": "src/server.js",
+  "scripts": {
+    "start:server": "node src/server.js configs/server.config.json",
+    "start:agent": "node src/agent.js configs/agent.config.json",
+    "start:client": "node src/client.js configs/client.config.json",
+    "check": "node -e \"console.log('ok')\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

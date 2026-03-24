@@ -1,0 +1,10 @@
+{
+  "publicBindAddr": "0.0.0.0",
+  "publicUdpPort": 19132,
+  "controlBindAddr": "0.0.0.0",
+  "controlPort": 7000,
+  "authToken": "CHANGE_ME_STRONG_TOKEN",
+  "maintenanceIntervalMs": 10000,
+  "sessionIdleTimeoutMs": 60000,
+  "agentPongTimeoutMs": 45000
+}

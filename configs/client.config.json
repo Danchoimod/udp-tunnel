@@ -1,0 +1,4 @@
+{
+  "serverHost": "your-vps-ip-here",
+  "serverUdpPort": 19132
+}
