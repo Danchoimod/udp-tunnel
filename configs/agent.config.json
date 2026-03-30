@@ -1,5 +1,5 @@
 {
-  "serverHost": "171.245.148.85",
+  "serverHost": "171.247.206.93",
   "serverControlPort": 7000,
   "authToken": "CHANGE_ME_STRONG_TOKEN",
   "clientName": "bedrock-multi-agent",

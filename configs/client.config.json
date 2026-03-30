@@ -1,7 +1,13 @@
 {
-  "serverHost": "171.245.148.85",
+  "serverHost": "171.247.206.93",
   "ports": [
-    { "localPort": 19132, "remotePort": 19130 },
-    { "localPort": 7551, "remotePort": 7550 }
+    {
+      "localPort": 19132,
+      "remotePort": 19130
+    },
+    {
+      "localPort": 7551,
+      "remotePort": 7550
+    }
   ]
 }
