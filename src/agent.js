@@ -1,8 +1,13 @@
 const fs = require("fs");
 const net = require("net");
+const tls = require("tls");
 const dgram = require("dgram");
 const path = require("path");
-const { encodeMessage, createLineParser } = require("./common/protocol");
+const {
+  encodeJson,
+  encodeUdpFromAgent,
+  createBinaryParser,
+} = require("./common/protocol");
 
 function loadConfig(configPath) {
   const resolvedPath = path.resolve(process.cwd(), configPath);
@@ -42,19 +47,15 @@ function startAgent(config) {
       return null;
     }
 
-    const host = config.localHost || "127.0.0.1";
+    const host = config.localUdpHost || config.localHost || "127.0.0.1";
     localSocket = dgram.createSocket("udp4");
-    localSocket.targetPort = localPort;
+    localSocket.targetPort = config.localUdpPort || localPort;
     localSocket.targetHost = host;
 
     localSocket.on("message", (payload) => {
       if (!controlSocket || !authenticated) return;
       touchSession(sessionId);
-      controlSocket.write(encodeMessage({
-        type: "UDP_FROM_LOCAL",
-        sessionId,
-        payloadBase64: payload.toString("base64"),
-      }));
+      controlSocket.write(encodeUdpFromAgent(sessionId, payload));
     });
 
     localSocket.on("error", (error) => {
@@ -69,12 +70,17 @@ function startAgent(config) {
 
   function connectControl() {
     authenticated = false;
-    const socket = net.createConnection({
+    
+    const options = {
       host: config.serverHost,
       port: config.serverControlPort,
-    }, () => {
-      console.log("Connected to tunnel server");
-      socket.write(encodeMessage({
+      rejectUnauthorized: config.sslRejectUnauthorized !== undefined ? config.sslRejectUnauthorized : false,
+    };
+
+    const socketToUse = config.useTLS ? tls : net;
+    const socket = socketToUse.connect(options, () => {
+      console.log(`Connected to tunnel server (${config.useTLS ? "TLS" : "TCP"})`);
+      socket.write(encodeJson({
         type: "AUTH",
         token: config.authToken,
         clientName: config.clientName || "multi-port-agent",
@@ -83,19 +89,28 @@ function startAgent(config) {
 
     controlSocket = socket;
 
-    const parseChunk = createLineParser((msg) => {
-      if (msg.type === "AUTH_OK") { authenticated = true; console.log("Authorized"); }
-      else if (msg.type === "PING") { socket.write(encodeMessage({ type: "PONG" })); }
-      else if (msg.type === "UDP_TO_LOCAL") {
+    const parseChunk = createBinaryParser((msg) => {
+      if (msg.type === "JSON") {
+        const payload = msg.payload;
+        if (payload.type === "AUTH_OK") { 
+          authenticated = true; 
+          console.log("Authorized"); 
+        } else if (payload.type === "PING") { 
+          socket.write(encodeJson({ type: "PONG" })); 
+        }
+      } else if (msg.type === "UDP_TO_AGENT") {
         if (!authenticated) return;
-        const { sessionId, localPort, payloadBase64 } = msg;
+        const { sessionId, localPort, payload } = msg;
         touchSession(sessionId);
         const localSocket = getOrCreateLocalSocket(sessionId, localPort);
         if (localSocket) {
-          localSocket.send(Buffer.from(payloadBase64, "base64"), localSocket.targetPort, localSocket.targetHost);
+          localSocket.send(payload, localSocket.targetPort, localSocket.targetHost);
         }
       }
-    }, (err) => console.error("Control error:", err.message));
+    }, (err) => {
+      console.error("Protocol error:", err.message);
+      socket.destroy();
+    });
 
     socket.on("data", parseChunk);
     socket.on("error", (err) => console.error("Control error:", err.message));

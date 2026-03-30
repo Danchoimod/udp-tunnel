@@ -1,5 +1,5 @@
 {
-  "serverHost": "your-vps-ip-here",
+  "serverHost": "171.245.148.85",
   "serverControlPort": 7000,
   "authToken": "CHANGE_ME_STRONG_TOKEN",
   "clientName": "bedrock-multi-agent",
