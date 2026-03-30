@@ -168,6 +168,9 @@ function startServer(config) {
     });
 
     socket.on("data", parseChunk);
+    socket.on("error", (err) => {
+      console.error(`Agent socket error ("${socket.agentName || 'unauthorized'}"):`, err.message);
+    });
     socket.on("close", () => {
       if (socket._replaced) return;
       if (socket.agentName && agents.get(socket.agentName)?.socket === socket) {

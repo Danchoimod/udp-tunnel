@@ -4,8 +4,7 @@
   "controlPort": 7000,
   "authToken": "CHANGE_ME_STRONG_TOKEN",
   "ports": [
-    { "publicPort": 19130, "localPort": 19132 },
-    { "publicPort": 7550, "localPort": 7551 }
+    { "publicPort": 7551, "localPort": 7551 }
   ],
   "maintenanceIntervalMs": 10000,
   "sessionIdleTimeoutMs": 60000,

@@ -8,7 +8,7 @@ function loadConfig(configPath) {
 }
 
 function startClientProxy(config) {
-  // Config mẫu: ports: [{ local: 19132, remote: 19132 }, { local: 7551, remote: 7551 }]
+  // Config mẫu: ports: [{ local: 7551, remote: 7551 }]
   config.ports.forEach(p => {
     const clientUdp = dgram.createSocket({ type: "udp4", reuseAddr: true });
     const serverSocketsByPlayer = new Map(); // playerKey -> { socket, lastSeen }
