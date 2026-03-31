@@ -9,7 +9,7 @@ jobs:
   deploy:
     name: Deploy to Server
     runs-on: ubuntu-latest
-    steps:
+    steps:  
       - name: Checkout Code
         uses: actions/checkout@v4
 
@@ -19,7 +19,7 @@ jobs:
         uses: wlixcc/SFTP-Deploy-Action@v1.2.4
         with:
           server: mbasic7.pikamc.vn
-          port: 25284
+          port: 2022
           username: ${{ secrets.PTERO_USERNAME }}.11d900c4
           password: ${{ secrets.PTERO_PASSWORD }}
           local_path: './*'
