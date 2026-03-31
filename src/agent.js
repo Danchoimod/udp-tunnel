@@ -113,7 +113,13 @@ function startAgent(config) {
         touchSession(sessionId);
         const localSocket = getOrCreateLocalSocket(sessionId, localPort);
         if (localSocket) {
-          localSocket.send(payload, localSocket.targetPort, localSocket.targetHost);
+          if (!localSocket.logged) {
+            console.log(`[UDP] New session ${sessionId.substring(0,8)}... for port ${localSocket.targetPort}`);
+            localSocket.logged = true;
+          }
+          localSocket.send(payload, localSocket.targetPort, localSocket.targetHost, (err) => {
+            if (err) console.error(`[UDP] Error sending to local:`, err.message);
+          });
         }
       }
     }, (err) => {

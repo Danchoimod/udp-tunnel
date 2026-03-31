@@ -6,11 +6,13 @@
   "ports": [
     {
       "publicPort": 25294,
-      "localPort": 7551
+      "localPort": 7551,
+      "agentName": "bedrock-multi-agent"
     },
     {
       "publicPort": 25296,
-      "localPort": 7551
+      "localPort": 7551,
+      "agentName": "bedrock-multi-agent"
     }
   ],
   "maintenanceIntervalMs": 10000,
