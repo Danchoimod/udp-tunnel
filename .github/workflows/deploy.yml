@@ -20,7 +20,7 @@ jobs:
         with:
           server: mbasic7.pikamc.vn
           port: 2022
-          username: ${{ secrets.PTERO_USERNAME }}.11d900c4
+          username: ${{ secrets.PTERO_USERNAME }}.4ed61d6c
           password: ${{ secrets.PTERO_PASSWORD }}
           local_path: './*'
           remote_path: '/'
