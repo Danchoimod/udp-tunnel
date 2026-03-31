@@ -10,8 +10,17 @@ const {
 } = require("./common/protocol");
 
 function loadConfig(configPath) {
-  const resolvedPath = path.resolve(process.cwd(), configPath);
-  return JSON.parse(fs.readFileSync(resolvedPath, "utf8"));
+  try {
+    const fullPath = path.resolve(process.cwd(), configPath);
+    if (!fs.existsSync(fullPath)) {
+      console.error(`ERROR: Config file not found at: ${fullPath}`);
+      process.exit(1);
+    }
+    return JSON.parse(fs.readFileSync(fullPath, "utf8"));
+  } catch (e) {
+    console.error(`ERROR loading config: ${e.message}`);
+    process.exit(1);
+  }
 }
 
 function startAgent(config) {
@@ -132,5 +141,6 @@ function startAgent(config) {
   connectControl();
 }
 
-const config = loadConfig(process.argv[2]);
+const configFilePath = process.argv[2] || "configs/agent.config.json";
+const config = loadConfig(configFilePath);
 startAgent(config);

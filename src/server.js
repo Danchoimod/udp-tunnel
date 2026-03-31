@@ -12,8 +12,60 @@ const {
 } = require("./common/protocol");
 
 function loadConfig(configPath) {
-  const raw = fs.readFileSync(path.resolve(process.cwd(), configPath), "utf8");
-  return JSON.parse(raw);
+  try {
+    const fullPath = path.resolve(process.cwd(), configPath);
+    if (!fs.existsSync(fullPath)) {
+      console.error(`ERROR: Config file not found at: ${fullPath}`);
+      process.exit(1);
+    }
+    return JSON.parse(fs.readFileSync(fullPath, "utf8"));
+  } catch (e) {
+    console.error(`ERROR loading config: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+// --- Trạng thái ---
+const stats = {
+  totalRequests: 0,
+  activeSessions: 0,
+  totalUp: 0,
+  totalDown: 0,
+  startTime: Date.now()
+};
+
+function formatBytes(bytes) {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+}
+
+function renderDashboard(config, agents, sessionByRemote) {
+  const duration = Math.floor((Date.now() - stats.startTime) / 1000);
+  const timeStr = `${Math.floor(duration / 3600)}h ${Math.floor((duration % 3600) / 60)}m ${duration % 60}s`;
+
+  process.stdout.write("\x1b[H\x1b[2J");
+  console.log("\x1b[36m=====================================================\x1b[0m");
+  console.log("\x1b[1m\x1b[35m            BEDROCK TUNNEL SERVER DASHBOARD          \x1b[0m");
+  console.log("\x1b[36m=====================================================\x1b[0m");
+  console.log(` Status      : \x1b[32mRUNNING\x1b[0m`);
+  console.log(` Host        : \x1b[33m${config.publicIP || "localhost"}\x1b[0m`);
+  console.log(` Uptime      : ${timeStr}`);
+  console.log(` Agents      : \x1b[33m${agents.size}\x1b[0m online`);
+  console.log(` Sessions    : \x1b[33m${sessionByRemote.size}\x1b[0m`);
+  console.log("\x1b[36m-----------------------------------------------------\x1b[0m");
+
+  console.log(` Control Port: \x1b[32m${config.controlPort}\x1b[0m`);
+  config.ports.forEach(p => {
+    console.log(` UDP Port    : \x1b[33m${p.publicPort}\x1b[0m (Public) -> Local :${p.localPort}`);
+  });
+
+  console.log("\x1b[36m-----------------------------------------------------\x1b[0m");
+  console.log(` Total Upload  : \x1b[32m${formatBytes(stats.totalUp)}\x1b[0m (from Agent)`);
+  console.log(` Total Download: \x1b[31m${formatBytes(stats.totalDown)}\x1b[0m (from Remote)`);
+  console.log("\x1b[36m=====================================================\x1b[0m");
 }
 
 function sessionKey(address, port, localPort) {
@@ -99,6 +151,8 @@ function startServer(config) {
         console.log(`[UDP] New session ${sessionId} for ${key} (Public Port: ${publicPort})`);
       }
 
+      stats.totalDown += payload.length;
+
       touchSession(sessionId);
       
       const targetName = portMapping.agentName || "default";
@@ -156,6 +210,7 @@ function startServer(config) {
         const remote = remoteBySession.get(msg.sessionId);
         if (remote) {
           touchSession(msg.sessionId);
+          stats.totalUp += msg.payload.length;
           const socketToUse = udpSockets.get(remote.localPort);
           if (socketToUse) {
             socketToUse.send(msg.payload, remote.port, remote.address);
@@ -203,7 +258,10 @@ function startServer(config) {
       }
     }
   }, config.maintenanceIntervalMs || 10000);
+
+  setInterval(() => renderDashboard(config, agents, sessionByRemote), 1000);
 }
 
-const config = loadConfig(process.argv[2]);
+const configFilePath = process.argv[2] || "configs/server.config.json";
+const config = loadConfig(configFilePath);
 startServer(config);

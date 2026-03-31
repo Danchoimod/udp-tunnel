@@ -1,0 +1,37 @@
+name: Deploy Backend to Pterodactyl
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # KHÔNG chạy npm install ở đây để tránh tạo ra node_modules nặng nề
+      
+      - name: Sync to Pterodactyl (SFTP)
+        uses: wlixcc/SFTP-Deploy-Action@v1.2.4
+        with:
+          server: mbasic7.pikamc.vn
+          port: 25284
+          username: ${{ secrets.PTERO_USERNAME }}.11d900c4
+          password: ${{ secrets.PTERO_PASSWORD }}
+          local_path: './*'
+          remote_path: '/'
+          sftp_only: true
+          # Lưu ý: Action này không hỗ trợ 'ignore', 
+          # nhưng vì ta không chạy npm install nên thư mục node_modules sẽ không tồn tại để bị upload.
+
+      - name: Restart Server via API
+        run: |
+          curl -X POST "https://cp.pikamc.vn/api/client/servers/4ed61d6c/power" \
+          -H "Authorization: Bearer ${{ secrets.PTERO_API_KEY }}" \
+          -H "Content-Type: application/json" \
+          -H "Accept: application/json" \
+          -d '{"signal": "restart"}'

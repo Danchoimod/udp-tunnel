@@ -1,9 +1,13 @@
 {
-  "serverHost": "171.247.206.93",
+  "serverHost": "mbasic7.pikamc.vn",
   "ports": [
     {
       "localPort": 7551,
-      "remotePort": 7551
+      "remotePort": 25294
+    },
+    {
+      "localPort": 7551,
+      "remotePort": 25296
     }
   ]
 }

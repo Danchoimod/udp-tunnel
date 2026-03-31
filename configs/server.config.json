@@ -1,10 +1,17 @@
 {
   "publicBindAddr": "0.0.0.0",
   "controlBindAddr": "0.0.0.0",
-  "controlPort": 7000,
+  "controlPort": 25284,
   "authToken": "CHANGE_ME_STRONG_TOKEN",
   "ports": [
-    { "publicPort": 7551, "localPort": 7551 }
+    {
+      "publicPort": 25294,
+      "localPort": 7551
+    },
+    {
+      "publicPort": 25296,
+      "localPort": 7551
+    }
   ],
   "maintenanceIntervalMs": 10000,
   "sessionIdleTimeoutMs": 60000,
