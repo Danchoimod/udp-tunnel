@@ -1,301 +1,389 @@
-const fs = require("fs");
-const net = require("net");
-const tls = require("tls");
-const dgram = require("dgram");
-const crypto = require("crypto");
-const path = require("path");
+/**
+ * server.js — Tunnel Server
+ *
+ * Implements the same server-side protocol as the Go "kami/ngrok" example:
+ *
+ * CONTROL CHANNEL (TCP, port = config.controlPort):
+ *   Client → Server: { type:"register", key, client_id, target, protocol }
+ *   Server → Client: { type:"registered", key, remote_port, protocol }
+ *   Server → Client: { type:"proxy", id }          (TCP tunnel request)
+ *   Server → Client: { type:"udp_open", id, remote_addr, protocol:"udp" }
+ *   Server → Client: { type:"udp_close", id }
+ *   Both directions: { type:"ping" } / { type:"pong" }
+ *
+ * DATA CHANNEL (same TCP port):
+ *   Client → Server: { type:"proxy", key, client_id, id }  (first line on new conn)
+ *   Then raw pipe between the waiting public connection and this socket.
+ *
+ * UDP DATA (same TCP port, but UDP socket):
+ *   Binary:  [msgType 1B][keyLen 2B BE][key][idLen 2B BE][id][payload]
+ *   Handshake: [1][keyLen][key]  (no id)
+ */
+
+const fs     = require('fs');
+const net    = require('net');
+const dgram  = require('dgram');
+const crypto = require('crypto');
+const path   = require('path');
+
 const {
-  encodeJson,
-  encodeUdpToAgent,
-  createBinaryParser,
-  PACKET_TYPES,
-} = require("./common/protocol");
+  UDP_MSG,
+  encodeControl,
+  buildUDPMessage,
+  parseUDPMessage,
+  createLineParser,
+} = require('./common/protocol');
 
-function loadConfig(configPath) {
+// ─── Config ──────────────────────────────────────────────────────────────────
+
+function loadConfig(filePath) {
   try {
-    const fullPath = path.resolve(process.cwd(), configPath);
-    if (!fs.existsSync(fullPath)) {
-      console.error(`ERROR: Config file not found at: ${fullPath}`);
-      process.exit(1);
-    }
-    return JSON.parse(fs.readFileSync(fullPath, "utf8"));
+    const full = path.resolve(process.cwd(), filePath);
+    if (!fs.existsSync(full)) { console.error('Config not found:', full); process.exit(1); }
+    return JSON.parse(fs.readFileSync(full, 'utf8'));
   } catch (e) {
-    console.error(`ERROR loading config: ${e.message}`);
-    process.exit(1);
+    console.error('Config error:', e.message); process.exit(1);
   }
 }
 
-// --- Trạng thái ---
-const stats = {
-  totalRequests: 0,
-  activeSessions: 0,
-  totalUp: 0,
-  totalDown: 0,
-  startTime: Date.now()
-};
+// ─── Stats ───────────────────────────────────────────────────────────────────
 
-function formatBytes(bytes) {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+const stats = { totalUp: 0, totalDown: 0, startTime: Date.now() };
+
+function fmtBytes(n) {
+  if (n === 0) return '0 B';
+  const k = 1024, s = ['B','KB','MB','GB','TB'];
+  const i = Math.floor(Math.log(n) / Math.log(k));
+  return (n / Math.pow(k, i)).toFixed(2) + ' ' + s[i];
 }
 
-function renderDashboard(config, agents, sessionByRemote) {
-  const duration = Math.floor((Date.now() - stats.startTime) / 1000);
-  const timeStr = `${Math.floor(duration / 3600)}h ${Math.floor((duration % 3600) / 60)}m ${duration % 60}s`;
-
-  process.stdout.write("\x1b[H\x1b[2J");
-  console.log("\x1b[36m" + "=" .repeat(60) + "\x1b[0m");
-  console.log("\x1b[1m\x1b[35m            BEDROCK TUNNEL SERVER DASHBOARD          \x1b[0m");
-  console.log("\x1b[1m\x1b[35m                (Powered by LFLauncher)              \x1b[0m");
-  console.log("\x1b[36m" + "=" .repeat(60) + "\x1b[0m");
-  console.log(` Status      : \x1b[32mRUNNING\x1b[0m`);
-  console.log(` Public Host : \x1b[33m${config.publicIP || "mbasic7.pikamc.vn"}\x1b[0m`);
-  console.log(` Uptime      : ${timeStr}`);
-  console.log(` Agents      : \x1b[33m${agents.size}\x1b[0m online`);
-  console.log(` Sessions    : \x1b[33m${sessionByRemote.size}\x1b[0m active`);
-  console.log("\x1b[36m" + "-" .repeat(60) + "\x1b[0m");
-
-  if (agents.size === 0) {
-    console.log(" \x1b[31m[!] No hosts connected.\x1b[0m Waiting for npm run host...");
-  } else {
-    for (const [name, agent] of agents) {
-      const world = agent.worldInfo;
-      console.log(` Host: \x1b[32m${name}\x1b[0m [%s]`, agent.socket.remoteAddress);
-      if (world) {
-        console.log(`   \x1b[35m>\x1b[0m World: \x1b[1m${world.serverName}\x1b[0m (\x1b[33m${world.playerCount}/${world.maxPlayers}\x1b[0m)`);
-        console.log(`   \x1b[35m>\x1b[0m Level: ${world.levelName}`);
-      } else {
-        console.log("   \x1b[30m(Searching for local world...)\x1b[0m");
-      }
-    }
-  }
-
-  console.log("\x1b[36m" + "-" .repeat(60) + "\x1b[0m");
+function renderDashboard(config, clients, pendingTcp, udpSessions) {
+  const dur = Math.floor((Date.now() - stats.startTime) / 1000);
+  const t   = `${Math.floor(dur/3600)}h ${Math.floor(dur%3600/60)}m ${dur%60}s`;
+  process.stdout.write('\x1b[H\x1b[2J');
+  console.log('\x1b[36m' + '═'.repeat(62) + '\x1b[0m');
+  console.log('\x1b[1m\x1b[35m         BEDROCK TUNNEL SERVER  (LFLauncher)         \x1b[0m');
+  console.log('\x1b[36m' + '═'.repeat(62) + '\x1b[0m');
+  console.log(` Uptime      : ${t}`);
+  console.log(` Clients     : \x1b[33m${clients.size}\x1b[0m`);
+  console.log(` Pending TCP : \x1b[33m${pendingTcp.size}\x1b[0m`);
+  console.log(` UDP sessions: \x1b[33m${udpSessions.size}\x1b[0m`);
+  console.log('\x1b[36m' + '─'.repeat(62) + '\x1b[0m');
   config.ports.forEach(p => {
-    console.log(` \x1b[33m[Port]\x1b[0m UDP \x1b[1m${p.publicPort}\x1b[0m (Public) -> Machine: \x1b[36m${p.agentName}\x1b[0m`);
+    const c = clients.get(p.clientId);
+    const status = c ? '\x1b[32mONLINE\x1b[0m' : '\x1b[31mWAITING\x1b[0m';
+    console.log(` \x1b[33m[UDP :${p.publicPort}]\x1b[0m ← client_id: \x1b[36m${p.clientId}\x1b[0m  ${status}`);
   });
-
-  console.log("\x1b[36m" + "-" .repeat(60) + "\x1b[0m");
-  console.log(` Total Upload  : \x1b[32m${formatBytes(stats.totalUp)}\x1b[0m (from Hosting Machine)`);
-  console.log(` Total Download: \x1b[31m${formatBytes(stats.totalDown)}\x1b[0m (from Remote Players)`);
-  console.log("\x1b[36m" + "=" .repeat(60) + "\x1b[0m");
+  console.log('\x1b[36m' + '─'.repeat(62) + '\x1b[0m');
+  console.log(` ▲ Total Up  : \x1b[32m${fmtBytes(stats.totalUp)}\x1b[0m`);
+  console.log(` ▼ Total Down: \x1b[31m${fmtBytes(stats.totalDown)}\x1b[0m`);
+  console.log('\x1b[36m' + '═'.repeat(62) + '\x1b[0m');
 }
 
-function sessionKey(address, port, localPort) {
-  return `${address}:${port}:${localPort}`;
-}
-
-function randomSessionId() {
-  return crypto.randomBytes(8).toString("hex");
-}
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 function startServer(config) {
-  let controlServer;
-  
-  if (config.sslKey && config.sslCert) {
-    const options = {
-      key: fs.readFileSync(path.resolve(process.cwd(), config.sslKey)),
-      cert: fs.readFileSync(path.resolve(process.cwd(), config.sslCert)),
-    };
-    controlServer = tls.createServer(options);
-  } else {
-    controlServer = net.createServer();
-  }
-  
-  const udpSockets = new Map(); 
-  const agents = new Map(); 
-  const sessionByRemote = new Map();
-  const remoteBySession = new Map();
-  const sessionLastSeen = new Map();
-  const dataConnections = new Map(); 
-  const sessionQueues = new Map(); 
+  // clientId → { socket, key, protocol, portMapping }
+  const clients    = new Map();
+  // requestId → { socket (waiting public conn), timer }
+  const pendingTcp = new Map();
+  // sessionId → { clientId, remoteAddr (ip:port) }
+  const udpSessions = new Map();
 
-  function cleanupSession(sessionId) {
-    const remote = remoteBySession.get(sessionId);
-    if (!remote) return;
-    sessionByRemote.delete(sessionKey(remote.address, remote.port, remote.localPort));
-    remoteBySession.delete(sessionId);
-    sessionLastSeen.delete(sessionId);
-    
-    const conn = dataConnections.get(sessionId);
-    if (conn) {
-      conn.destroy();
-      dataConnections.delete(sessionId);
-    }
-    sessionQueues.delete(sessionId);
-  }
-
-  function cleanupAgentSessions(agentName) {
-    for (const [sid, remote] of remoteBySession) {
-      if (remote.agentName === agentName) cleanupSession(sid);
-    }
-  }
-
-  function touchSession(sessionId) {
-    sessionLastSeen.set(sessionId, Date.now());
-  }
-
-  function sendToAgent(agentName, message) {
-    const agent = agents.get(agentName);
-    if (!agent) return false;
-    agent.socket.write(encodeJson(message));
-    return true;
-  }
+  // ── UDP public sockets ──────────────────────────────────────────────────
+  const udpPublicSockets = new Map(); // publicPort → dgram.Socket
 
   config.ports.forEach(portMapping => {
-    const udpSocket = dgram.createSocket("udp4");
-    const publicPort = portMapping.publicPort;
-    const localPort = portMapping.localPort;
+    if (portMapping.protocol && portMapping.protocol !== 'udp') return; // only UDP for Bedrock
 
-    udpSocket.on("message", (payload, remoteInfo) => {
-      const key = sessionKey(remoteInfo.address, remoteInfo.port, localPort);
-      let sessionId = sessionByRemote.get(key);
+    const publicPort = portMapping.publicPort;
+    const sock       = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+
+    sock.on('message', (msg, rinfo) => {
+      const remoteAddr = `${rinfo.address}:${rinfo.port}`;
+      const client     = clients.get(portMapping.clientId);
+      if (!client) return; // no agent connected
+
+      // Find existing session for this remoteAddr+port
+      let sessionId = null;
+      for (const [id, sess] of udpSessions) {
+        if (sess.clientId === portMapping.clientId && sess.remoteAddr === remoteAddr) {
+          sessionId = id;
+          break;
+        }
+      }
 
       if (!sessionId) {
-        sessionId = randomSessionId();
-        const targetAgentName = portMapping.agentName || "default";
-        
-        sessionByRemote.set(key, sessionId);
-        remoteBySession.set(sessionId, {
-          address: remoteInfo.address, port: remoteInfo.port,
-          localPort: localPort, publicPort: publicPort,
-          agentName: targetAgentName
-        });
+        // New player → create session, notify client via control
+        sessionId = crypto.randomBytes(8).toString('hex');
+        udpSessions.set(sessionId, { clientId: portMapping.clientId, remoteAddr, publicPort });
+        client.socket.write(encodeControl({
+          type: 'udp_open',
+          id: sessionId,
+          remote_addr: remoteAddr,
+          protocol: 'udp',
+        }));
+        console.log(`\x1b[35m[UDP Open]\x1b[0m Session \x1b[33m${sessionId}\x1b[0m from ${remoteAddr}`);
       }
 
-      stats.totalDown += payload.length;
-      touchSession(sessionId);
-      
-      const targetName = portMapping.agentName || "default";
-      const agent = agents.get(targetName);
-      if (!agent) return;
-
-      const dataConn = dataConnections.get(sessionId);
-      if (dataConn) {
-        dataConn.write(encodeUdpToAgent(sessionId, localPort, payload));
-      } else {
-        // Request a new data connection if not already pending
-        if (!sessionQueues.has(sessionId)) {
-          sessionQueues.set(sessionId, []);
-          agent.socket.write(encodeControlRequest(sessionId, localPort));
-        }
-        
-        // Queue packet
-        const queue = sessionQueues.get(sessionId);
-        if (queue.length < 100) queue.push(payload);
-      }
+      // Forward to client via UDP data channel
+      stats.totalDown += msg.length;
+      const udpPkt = buildUDPMessage(UDP_MSG.DATA, client.key, sessionId, msg);
+      client.udpConn && client.udpConn.send(udpPkt, client.udpPort, client.udpAddr);
     });
 
-    udpSocket.bind(publicPort, config.publicBindAddr || "0.0.0.0", () => {
-      console.log(`[UDP Ready] Port ${publicPort}`);
+    sock.on('error', (err) => console.error(`[UDP :${publicPort}] Error:`, err.message));
+    sock.bind(publicPort, config.publicBindAddr || '0.0.0.0', () => {
+      console.log(`\x1b[32m[UDP Ready]\x1b[0m Port ${publicPort} (client_id: ${portMapping.clientId})`);
     });
 
-    udpSockets.set(publicPort, udpSocket);
+    udpPublicSockets.set(publicPort, sock);
   });
 
-  function setupAgentSocket(socket) {
-    const parseChunk = createBinaryParser((msg) => {
-      if (msg.type === "JSON") {
-        const payload = msg.payload;
-        if (!socket.agentName && !socket.isDataConn) {
-          if (payload.type === "AUTH" && payload.token === config.authToken) {
-            const clientName = payload.clientName || "default";
-            const existing = agents.get(clientName);
-            if (existing) {
-              existing.socket._replaced = true;
-              existing.socket.destroy();
-            }
-            socket.agentName = clientName;
-            agents.set(clientName, {
-              socket: socket,
-              lastPongAt: Date.now(),
-              worldInfo: null
-            });
-            socket.write(encodeJson({ type: "AUTH_OK" }));
-          } else {
-            socket.destroy();
-          }
+  // ── UDP control socket (same port as TCP control, but UDP) ──────────────
+  const udpCtrl = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+
+  udpCtrl.on('message', (buf, rinfo) => {
+    const parsed = parseUDPMessage(buf);
+    if (!parsed) return;
+
+    // Find client by key
+    let foundClient = null;
+    let foundId     = null;
+    for (const [id, c] of clients) {
+      if (c.key === parsed.key) { foundClient = c; foundId = id; break; }
+    }
+    if (!foundClient) return;
+
+    // Track client UDP address
+    foundClient.udpAddr = rinfo.address;
+    foundClient.udpPort = rinfo.port;
+    foundClient.udpConn = udpCtrl;
+
+    switch (parsed.msgType) {
+      case UDP_MSG.HANDSHAKE:
+        // Reply with handshake to confirm
+        udpCtrl.send(
+          buildUDPMessage(UDP_MSG.HANDSHAKE, parsed.key, '', null),
+          rinfo.port, rinfo.address
+        );
+        console.log(`\x1b[34m[UDP Handshake]\x1b[0m Client ${foundId} from ${rinfo.address}:${rinfo.port}`);
+        break;
+
+      case UDP_MSG.DATA: {
+        // Data FROM client → forward to public player
+        const sess = udpSessions.get(parsed.id);
+        if (!sess) break;
+        const publicSock = udpPublicSockets.get(sess.publicPort);
+        if (!publicSock) break;
+        const [peerIp, peerPortStr] = sess.remoteAddr.split(':');
+        const peerPort = parseInt(peerPortStr, 10);
+        stats.totalUp += parsed.payload.length;
+        publicSock.send(parsed.payload, peerPort, peerIp);
+        break;
+      }
+
+      case UDP_MSG.CLOSE: {
+        const sess = udpSessions.get(parsed.id);
+        if (sess) {
+          udpSessions.delete(parsed.id);
+          console.log(`\x1b[31m[UDP Close]\x1b[0m Session ${parsed.id}`);
+        }
+        break;
+      }
+
+      case UDP_MSG.PING:
+        // Pong back
+        udpCtrl.send(
+          buildUDPMessage(UDP_MSG.PONG, parsed.key, parsed.id, parsed.payload),
+          rinfo.port, rinfo.address
+        );
+        break;
+
+      case UDP_MSG.PONG:
+        // client pong — nothing to do
+        break;
+    }
+  });
+
+  udpCtrl.bind(config.controlPort, config.controlBindAddr || '0.0.0.0', () => {
+    console.log(`\x1b[32m[UDP Ctrl]\x1b[0m Listening on port ${config.controlPort} (for UDP handshake)`);
+  });
+
+  // ── TCP control server ──────────────────────────────────────────────────
+  const tcpServer = net.createServer();
+
+  tcpServer.on('connection', (socket) => {
+    socket.setNoDelay(true);
+    let registered = false;
+    let client = null;
+    let clientId = null;
+
+    const parser = createLineParser((msg) => {
+      // ── DATA CONN: first message is "proxy" ─────────────────────────────
+      if (!registered && msg.type === 'proxy') {
+        // This is a data connection for a pending TCP proxy request
+        const pendingEntry = pendingTcp.get(msg.id);
+        if (!pendingEntry) {
+          socket.destroy();
+          return;
+        }
+        clearTimeout(pendingEntry.timer);
+        pendingTcp.delete(msg.id);
+
+        const publicConn = pendingEntry.socket;
+        console.log(`\x1b[32m[TCP Pipe]\x1b[0m Proxy ${msg.id} connected`);
+
+        // Pipe publicConn ↔ socket
+        publicConn.pipe(socket);
+        socket.pipe(publicConn);
+
+        publicConn.on('close', () => socket.destroy());
+        socket.on('close', () => publicConn.destroy());
+        publicConn.on('error', () => socket.destroy());
+        socket.on('error', () => publicConn.destroy());
+
+        // Count traffic
+        publicConn.on('data', (d) => { stats.totalDown += d.length; });
+        socket.on('data', (d)    => { stats.totalUp   += d.length; });
+        return;
+      }
+
+      // ── CONTROL CONN: first message is "register" ───────────────────────
+      if (!registered && msg.type === 'register') {
+        clientId = msg.client_id || 'default';
+
+        // Replace old connection for same clientId
+        const old = clients.get(clientId);
+        if (old) {
+          try { old.socket.destroy(); } catch (_) {}
+        }
+
+        const key = (msg.key && msg.key.trim())
+          ? msg.key.trim()
+          : crypto.randomBytes(16).toString('hex');
+
+        const portMapping = config.ports.find(p => p.clientId === clientId);
+        if (!portMapping) {
+          socket.write(encodeControl({ type: 'error', error: `no port mapping for client_id: ${clientId}` }));
+          socket.destroy();
           return;
         }
 
-        if (socket.isDataConn) return; // Data connections don't handle PING/WORLD_INFO here
+        client = {
+          socket,
+          key,
+          protocol: msg.protocol || 'tcp',
+          portMapping,
+          lastPong: Date.now(),
+          udpAddr: null, udpPort: null, udpConn: null,
+        };
+        clients.set(clientId, client);
+        registered = true;
 
-        if (payload.type === "PONG") {
-          const agent = agents.get(socket.agentName);
-          if (agent) agent.lastPongAt = Date.now();
-        } else if (payload.type === "WORLD_INFO") {
-          const agent = agents.get(socket.agentName);
-          if (agent) agent.worldInfo = payload;
-        }
-      } else if (msg.type === "UDP_FROM_AGENT") {
-        const remote = remoteBySession.get(msg.sessionId);
-        if (remote) {
-          touchSession(msg.sessionId);
-          stats.totalUp += msg.payload.length;
-          const socketToUse = udpSockets.get(remote.publicPort);
-          if (socketToUse) socketToUse.send(msg.payload, remote.port, remote.address);
-        }
-      } else if (msg.type === "DATA_INIT") {
-        const sessionId = msg.sessionId;
-        const remote = remoteBySession.get(sessionId);
-        if (remote) {
-          socket.isDataConn = true;
-          socket.sessionId = sessionId;
-          dataConnections.set(sessionId, socket);
-          
-          // Send queued packets
-          const queue = sessionQueues.get(sessionId);
-          if (queue) {
-            queue.forEach(p => socket.write(encodeUdpToAgent(sessionId, remote.localPort, p)));
-            sessionQueues.delete(sessionId);
-          }
-          console.log(`[DataConn] Session ${sessionId} linked.`);
-        } else {
-          socket.destroy();
-        }
+        socket.write(encodeControl({
+          type: 'registered',
+          key,
+          remote_port: portMapping.publicPort,
+          protocol: msg.protocol || 'tcp',
+        }));
+
+        console.log(`\x1b[32m[Register]\x1b[0m client_id=\x1b[33m${clientId}\x1b[0m key=${key} port=${portMapping.publicPort} proto=${msg.protocol || 'tcp'}`);
+        return;
       }
+
+      // ── Already registered: handle control messages ─────────────────────
+      if (!registered) { socket.destroy(); return; }
+
+      if (msg.type === 'ping') {
+        socket.write(encodeControl({ type: 'pong' }));
+      } else if (msg.type === 'pong') {
+        if (client) client.lastPong = Date.now();
+      } else if (msg.type === 'world_info') {
+        if (client) client.worldInfo = msg;
+      } else if (msg.type === 'udp_close') {
+        if (msg.id) udpSessions.delete(msg.id);
+      } else if (msg.type === 'udp_idle') {
+        if (msg.id) udpSessions.delete(msg.id);
+      }
+
     }, (err) => {
       socket.destroy();
     });
 
-    socket.on("data", parseChunk);
-    socket.on("close", () => {
-      if (socket._replaced) return;
-      if (socket.isDataConn && socket.sessionId) {
-        dataConnections.delete(socket.sessionId);
-        return;
-      }
-      if (socket.agentName && agents.get(socket.agentName)?.socket === socket) {
-        const agentName = socket.agentName;
-        agents.delete(agentName);
-        cleanupAgentSessions(agentName);
+    socket.on('data', parser);
+
+    socket.on('close', () => {
+      if (clientId && clients.get(clientId)?.socket === socket) {
+        clients.delete(clientId);
+        console.log(`\x1b[31m[Disconnect]\x1b[0m client_id=${clientId}`);
+        // Clean up UDP sessions for this client
+        for (const [id, sess] of udpSessions) {
+          if (sess.clientId === clientId) udpSessions.delete(id);
+        }
       }
     });
-  }
 
-  controlServer.listen(config.controlPort, config.controlBindAddr || "0.0.0.0");
-  controlServer.on("connection", setupAgentSocket);
+    socket.on('error', () => {});
+  });
+
+  // ── TCP public ports (for TCP tunnels if needed) ────────────────────────
+  config.ports.forEach(portMapping => {
+    if (portMapping.protocol === 'udp') return; // skip, handled by UDP socket
+    if (!portMapping.tcpPublicPort) return;
+
+    const pubServer = net.createServer();
+    pubServer.on('connection', (publicConn) => {
+      publicConn.setNoDelay(true);
+      const clientEntry = clients.get(portMapping.clientId);
+      if (!clientEntry) { publicConn.destroy(); return; }
+
+      const reqId = crypto.randomBytes(8).toString('hex');
+      const timer = setTimeout(() => {
+        publicConn.destroy();
+        pendingTcp.delete(reqId);
+        console.log(`\x1b[31m[TCP Timeout]\x1b[0m Proxy ${reqId} expired`);
+      }, config.proxyTimeoutMs || 10000);
+
+      pendingTcp.set(reqId, { socket: publicConn, timer });
+      clientEntry.socket.write(encodeControl({ type: 'proxy', id: reqId }));
+      console.log(`\x1b[34m[TCP Proxy]\x1b[0m Requesting proxy ${reqId} for client ${portMapping.clientId}`);
+    });
+
+    pubServer.listen(portMapping.tcpPublicPort, config.publicBindAddr || '0.0.0.0', () => {
+      console.log(`\x1b[32m[TCP Public]\x1b[0m Port ${portMapping.tcpPublicPort} (client_id: ${portMapping.clientId})`);
+    });
+  });
+
+  tcpServer.listen(config.controlPort, config.controlBindAddr || '0.0.0.0', () => {
+    console.log(`\x1b[32m[Control]\x1b[0m TCP listening on port ${config.controlPort}`);
+  });
+
+  // ── Heartbeat ──────────────────────────────────────────────────────────
+  const pingIntervalMs = config.pingIntervalMs || 20000;
+  const pongTimeoutMs  = config.pongTimeoutMs  || 45000;
 
   setInterval(() => {
     const now = Date.now();
-    for (const [sid, last] of sessionLastSeen) {
-      if (now - last > (config.sessionIdleTimeoutMs || 60000)) cleanupSession(sid);
-    }
-    for (const [name, agent] of agents) {
-      if (now - agent.lastPongAt > (config.agentPongTimeoutMs || 45000)) {
-        agent.socket.destroy();
+    for (const [id, c] of clients) {
+      if (now - c.lastPong > pongTimeoutMs) {
+        console.log(`\x1b[31m[Timeout]\x1b[0m client_id=${id} pong timeout`);
+        c.socket.destroy();
       } else {
-        sendToAgent(name, { type: "PING" });
+        c.socket.write(encodeControl({ type: 'ping' }));
       }
     }
-  }, config.maintenanceIntervalMs || 10000);
+    // Clean up expired UDP sessions (60s idle)
+    for (const [id, sess] of udpSessions) {
+      if (!clients.has(sess.clientId)) udpSessions.delete(id);
+    }
+  }, pingIntervalMs);
 
-  setInterval(() => renderDashboard(config, agents, sessionByRemote), 1000);
+  // ── Dashboard ──────────────────────────────────────────────────────────
+  setInterval(() => renderDashboard(config, clients, pendingTcp, udpSessions), 1000);
 }
 
-const configFilePath = process.argv[2] || "configs/server.config.json";
-const config = loadConfig(configFilePath);
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+const configPath = process.argv[2] || 'configs/server.config.json';
+const config     = loadConfig(configPath);
 startServer(config);

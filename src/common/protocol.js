@@ -1,158 +1,124 @@
-const MAGIC = Buffer.from("LB"); // LFLauncher Binary protocol
-const MAGIC_LEN = MAGIC.length; // 2
+/**
+ * Protocol matching the Go example (kami/ngrok):
+ *
+ * CONTROL CHANNEL: Plain JSON, newline-delimited (one JSON object per line)
+ *   Client → Server:  { type: "register", key, client_id, target, protocol }
+ *   Server → Client:  { type: "registered", key, remote_port, protocol }
+ *   Server → Client:  { type: "proxy", id }          (TCP)
+ *   Server → Client:  { type: "udp_open", id, remote_addr, protocol }
+ *   Server → Client:  { type: "udp_close", id }
+ *   Client → Server:  { type: "ping" }
+ *   Server → Client:  { type: "pong" }
+ *   Client → Server:  { type: "proxy", key, client_id, id }  (on DATA conn)
+ *
+ * UDP DATA CHANNEL: Binary over UDP socket (same port as control TCP)
+ *   Format:  [msgType 1B][keyLen 2B BE][key bytes][idLen 2B BE][id bytes][payload]
+ *   Except for handshake: [msgType 1B][keyLen 2B BE][key bytes]  (no id field)
+ *
+ *   msgType values:
+ *     1 = handshake
+ *     2 = data
+ *     3 = close
+ *     4 = ping
+ *     5 = pong
+ */
 
-const PACKET_TYPES = {
-  JSON: 0x01,
-  UDP_TO_AGENT: 0x02,
-  UDP_FROM_AGENT: 0x03,
-  CONTROL_REQUEST_DATA: 0x04,
-  DATA_INIT: 0x05,
+const UDP_MSG = {
+  HANDSHAKE: 1,
+  DATA: 2,
+  CLOSE: 3,
+  PING: 4,
+  PONG: 5,
 };
 
-function encodeJson(message) {
-  const jsonStr = JSON.stringify(message);
-  const jsonBuf = Buffer.from(jsonStr, "utf8");
-  const packet = Buffer.allocUnsafe(MAGIC_LEN + 4 + 1 + jsonBuf.length);
-  
-  MAGIC.copy(packet, 0);
-  packet.writeUInt32BE(jsonBuf.length + 1, MAGIC_LEN);
-  packet.writeUInt8(PACKET_TYPES.JSON, MAGIC_LEN + 4);
-  jsonBuf.copy(packet, MAGIC_LEN + 4 + 1);
-  return packet;
+/**
+ * Encode a control-plane JSON message (newline-delimited).
+ */
+function encodeControl(obj) {
+  return Buffer.from(JSON.stringify(obj) + '\n', 'utf8');
 }
 
-function encodeUdpToAgent(sessionIdHex, localPort, payload) {
-  const sessionBuf = Buffer.from(sessionIdHex, "hex");
-  const headerLen = sessionBuf.length + 2;
-  const packet = Buffer.allocUnsafe(MAGIC_LEN + 4 + 1 + headerLen + payload.length);
+/**
+ * Build a UDP binary message.
+ * For HANDSHAKE: no id field.
+ * For others: id field present.
+ */
+function buildUDPMessage(msgType, key, id, payload) {
+  const keyBuf = Buffer.from(key || '', 'utf8');
+  const idBuf  = Buffer.from(id  || '', 'utf8');
+  const hasId  = msgType !== UDP_MSG.HANDSHAKE;
+  const payBuf = payload ? Buffer.from(payload) : Buffer.alloc(0);
 
-  MAGIC.copy(packet, 0);
-  packet.writeUInt32BE(1 + headerLen + payload.length, MAGIC_LEN);
-  packet.writeUInt8(PACKET_TYPES.UDP_TO_AGENT, MAGIC_LEN + 4);
-  sessionBuf.copy(packet, MAGIC_LEN + 4 + 1);
-  packet.writeUInt16BE(localPort, MAGIC_LEN + 4 + 1 + sessionBuf.length);
-  payload.copy(packet, MAGIC_LEN + 4 + 1 + sessionBuf.length + 2);
-  return packet;
+  let total = 1 + 2 + keyBuf.length;
+  if (hasId) total += 2 + idBuf.length;
+  total += payBuf.length;
+
+  const buf = Buffer.allocUnsafe(total);
+  let off = 0;
+  buf[off++] = msgType;
+  buf.writeUInt16BE(keyBuf.length, off); off += 2;
+  keyBuf.copy(buf, off); off += keyBuf.length;
+  if (hasId) {
+    buf.writeUInt16BE(idBuf.length, off); off += 2;
+    idBuf.copy(buf, off); off += idBuf.length;
+  }
+  payBuf.copy(buf, off);
+  return buf;
 }
 
-function encodeControlRequest(sessionIdHex, localPort) {
-  const sessionBuf = Buffer.from(sessionIdHex, "hex");
-  const packet = Buffer.allocUnsafe(MAGIC_LEN + 4 + 1 + sessionBuf.length + 2);
-  MAGIC.copy(packet, 0);
-  packet.writeUInt32BE(1 + sessionBuf.length + 2, MAGIC_LEN);
-  packet.writeUInt8(PACKET_TYPES.CONTROL_REQUEST_DATA, MAGIC_LEN + 4);
-  sessionBuf.copy(packet, MAGIC_LEN + 4 + 1);
-  packet.writeUInt16BE(localPort, MAGIC_LEN + 4 + 1 + sessionBuf.length);
-  return packet;
+/**
+ * Parse a UDP binary message.
+ * Returns { msgType, key, id, payload } or null if invalid.
+ */
+function parseUDPMessage(buf) {
+  if (buf.length < 3) return null;
+  const msgType = buf[0];
+  const keyLen  = buf.readUInt16BE(1);
+  if (buf.length < 3 + keyLen) return null;
+  const key = buf.slice(3, 3 + keyLen).toString('utf8');
+  let off = 3 + keyLen;
+
+  let id = '';
+  if (msgType !== UDP_MSG.HANDSHAKE) {
+    if (buf.length < off + 2) return null;
+    const idLen = buf.readUInt16BE(off); off += 2;
+    if (buf.length < off + idLen) return null;
+    id = buf.slice(off, off + idLen).toString('utf8');
+    off += idLen;
+  }
+
+  const payload = buf.slice(off);
+  return { msgType, key, id, payload };
 }
 
-function encodeDataInit(sessionIdHex) {
-  const sessionBuf = Buffer.from(sessionIdHex, "hex");
-  const packet = Buffer.allocUnsafe(MAGIC_LEN + 4 + 1 + sessionBuf.length);
-  MAGIC.copy(packet, 0);
-  packet.writeUInt32BE(1 + sessionBuf.length, MAGIC_LEN);
-  packet.writeUInt8(PACKET_TYPES.DATA_INIT, MAGIC_LEN + 4);
-  sessionBuf.copy(packet, MAGIC_LEN + 4 + 1);
-  return packet;
-}
-
-function encodeUdpFromAgent(sessionIdHex, payload) {
-  const sessionBuf = Buffer.from(sessionIdHex, "hex");
-  const headerLen = sessionBuf.length;
-  const packet = Buffer.allocUnsafe(MAGIC_LEN + 4 + 1 + headerLen + payload.length);
-
-  MAGIC.copy(packet, 0);
-  packet.writeUInt32BE(1 + headerLen + payload.length, MAGIC_LEN);
-  packet.writeUInt8(PACKET_TYPES.UDP_FROM_AGENT, MAGIC_LEN + 4);
-  sessionBuf.copy(packet, MAGIC_LEN + 4 + 1);
-  payload.copy(packet, MAGIC_LEN + 4 + 1 + sessionBuf.length);
-  return packet;
-}
-
-function createBinaryParser(onMessage, onError) {
-  const MAX_BUFFER = 2 * 1024 * 1024; // 2MB accumulated buffer
-  const MAX_PAYLOAD_SIZE = 1024 * 1024; // 1MB per packet payload limit
-  let buffer = Buffer.alloc(0);
+/**
+ * Create a line-based JSON parser for a TCP stream.
+ * Calls onMessage(obj) for each complete JSON line received.
+ */
+function createLineParser(onMessage, onError) {
+  let buf = '';
 
   return (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    if (buffer.length > MAX_BUFFER) {
-      buffer = Buffer.alloc(0);
-      onError(new Error("Buffer overflow, closing connection"));
-      return;
-    }
+    buf += chunk.toString('utf8');
+    const lines = buf.split('\n');
+    buf = lines.pop(); // keep incomplete line
 
-    while (buffer.length >= MAGIC_LEN + 4 + 1) {
-      // Fast byte-by-byte magic check
-      if (buffer[0] !== 0x4c || buffer[1] !== 0x42) {
-        // Find next magic
-        const nextMagic = buffer.indexOf(MAGIC, 1);
-        if (nextMagic === -1) {
-          buffer = Buffer.alloc(0);
-          return;
-        }
-        buffer = buffer.slice(nextMagic);
-        continue;
-      }
-
-      const payloadLen = buffer.readUInt32BE(MAGIC_LEN);
-      if (payloadLen > MAX_PAYLOAD_SIZE) {
-        buffer = Buffer.alloc(0);
-        onError(new Error(`Oversized packet: ${payloadLen} bytes`));
-        return;
-      }
-
-      const totalPacketLen = MAGIC_LEN + 4 + payloadLen;
-
-      if (buffer.length < totalPacketLen) break;
-
-      const packet = buffer.slice(MAGIC_LEN + 4, totalPacketLen);
-      buffer = buffer.slice(totalPacketLen);
-
-      const type = packet.readUInt8(0);
-      const data = packet.slice(1);
-
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
       try {
-        if (type === PACKET_TYPES.JSON) {
-          onMessage({ type: 'JSON', payload: JSON.parse(data.toString('utf8')) });
-        } else if (type === PACKET_TYPES.UDP_TO_AGENT) {
-          onMessage({
-            type: 'UDP_TO_AGENT',
-            sessionId: data.slice(0, 8).toString('hex'),
-            localPort: data.readUInt16BE(8),
-            payload: data.slice(10),
-          });
-        } else if (type === PACKET_TYPES.UDP_FROM_AGENT) {
-          onMessage({
-            type: 'UDP_FROM_AGENT',
-            sessionId: data.slice(0, 8).toString('hex'),
-            payload: data.slice(8),
-          });
-        } else if (type === PACKET_TYPES.CONTROL_REQUEST_DATA) {
-          onMessage({
-            type: 'CONTROL_REQUEST_DATA',
-            sessionId: data.slice(0, 8).toString('hex'),
-            localPort: data.readUInt16BE(8),
-          });
-        } else if (type === PACKET_TYPES.DATA_INIT) {
-          onMessage({
-            type: 'DATA_INIT',
-            sessionId: data.slice(0, 8).toString('hex'),
-          });
-        }
-      } catch (err) {
-        onError(err);
+        onMessage(JSON.parse(trimmed));
+      } catch (e) {
+        // ignore bad JSON lines
       }
     }
   };
 }
 
 module.exports = {
-  PACKET_TYPES,
-  encodeJson,
-  encodeUdpToAgent,
-  encodeUdpFromAgent,
-  encodeControlRequest,
-  encodeDataInit,
-  createBinaryParser,
+  UDP_MSG,
+  encodeControl,
+  buildUDPMessage,
+  parseUDPMessage,
+  createLineParser,
 };

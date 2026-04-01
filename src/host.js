@@ -1,192 +1,384 @@
-const fs = require("fs");
-const net = require("net");
-const tls = require("tls");
-const dgram = require("dgram");
-const path = require("path");
-const crypto = require("crypto");
+/**
+ * host.js — Tunnel Agent (Host side)
+ *
+ * Mirrors the Go client (kami/ngrok/client/main.go) behavior:
+ *
+ * 1. CONTROL CHANNEL: connects TCP to server, sends "register" message.
+ *    Receives "proxy" (TCP) or "udp_open" commands from server.
+ *
+ * 2. TCP PROXY: On "proxy" command, opens a new TCP conn to server + a conn
+ *    to the local backend, then pipes them together.
+ *
+ * 3. UDP: On "udp_open", creates a local UDP socket dialing the local game port,
+ *    and relays data through the UDP data channel (binary protocol).
+ *    Sends UDP handshake to server and maintains keep-alive pings.
+ *
+ * 4. WORLD INFO: Sends NetherNet discovery pings to detect local Bedrock world
+ *    and reports it to server as "world_info".
+ */
+
+const fs     = require('fs');
+const net    = require('net');
+const dgram  = require('dgram');
+const crypto = require('crypto');
+const path   = require('path');
+
 const {
-  encodeJson,
-  encodeUdpFromAgent,
-  encodeDataInit,
-  createBinaryParser,
-  PACKET_TYPES,
-} = require("./common/protocol");
+  UDP_MSG,
+  encodeControl,
+  buildUDPMessage,
+  parseUDPMessage,
+  createLineParser,
+} = require('./common/protocol');
 
-// CLI Params (Kami Style)
-const cliPort = process.argv[3] ? parseInt(process.argv[3]) : 19132;
-const cliProto = process.argv[4] || 'udp';
-const cliHost = process.argv[5] || '127.0.0.1';
+// ─── CLI / Config ─────────────────────────────────────────────────────────────
 
-// NetherNet constant key
-const NETHERNET_KEY = crypto.createHash('sha256').update(Buffer.from([0xEF, 0xBE, 0xAD, 0xDE, 0x00, 0x00, 0x00, 0x00])).digest();
-const EXPLORER_GUID = crypto.randomBytes(8).readBigUInt64LE();
+// index.js passes: <configPath> <localPort> <protocol> <localHost>
+const cliLocalPort = process.argv[3] ? parseInt(process.argv[3], 10) : 19132;
+const cliProto     = (process.argv[4] || 'udp').toLowerCase();
+const cliLocalHost = process.argv[5] || '127.0.0.1';
 
-function loadConfig(configPath) {
+function loadConfig(filePath) {
   try {
-    const fullPath = path.resolve(process.cwd(), configPath);
-    if (!fs.existsSync(fullPath)) return { serverHost: "mbasic7.pikamc.vn", serverControlPort: 25284, authToken: "CHANGE_ME_STRONG_TOKEN" };
-    return JSON.parse(fs.readFileSync(fullPath, "utf8"));
+    const full = path.resolve(process.cwd(), filePath);
+    if (!fs.existsSync(full)) {
+      return { serverHost: 'mbasic7.pikamc.vn', serverControlPort: 25284, clientId: 'bedrock-multi-agent' };
+    }
+    return JSON.parse(fs.readFileSync(full, 'utf8'));
   } catch (e) {
-    return { serverHost: "mbasic7.pikamc.vn", serverControlPort: 25284, authToken: "CHANGE_ME_STRONG_TOKEN" };
+    return { serverHost: 'mbasic7.pikamc.vn', serverControlPort: 25284, clientId: 'bedrock-multi-agent' };
   }
 }
 
+// ─── NetherNet (Bedrock LAN discovery) ──────────────────────────────────────
+
+const NETHERNET_KEY = crypto.createHash('sha256')
+  .update(Buffer.from([0xEF, 0xBE, 0xAD, 0xDE, 0x00, 0x00, 0x00, 0x00]))
+  .digest();
+const EXPLORER_GUID = BigInt('0x' + crypto.randomBytes(8).toString('hex'));
+
+function buildDiscoveryPing() {
+  const body = Buffer.alloc(18);
+  body.writeUInt16LE(0, 0);      // ptype = 0 (Discovery Request)
+  body.writeBigUInt64LE(EXPLORER_GUID, 2);
+  // last 8 bytes = 0 padding
+  const raw  = Buffer.concat([Buffer.from([0x12, 0x00]), body]); // length prefix 0x12 = 18
+  const hmac = crypto.createHmac('sha256', NETHERNET_KEY).update(raw).digest();
+  const cipher = crypto.createCipheriv('aes-256-ecb', NETHERNET_KEY, null);
+  cipher.setAutoPadding(true);
+  return Buffer.concat([hmac, cipher.update(raw), cipher.final()]);
+}
+
+function parseDiscoveryResponse(buf) {
+  try {
+    if (buf.length < 34) return null;
+    const enc    = buf.slice(32);
+    const cipher = crypto.createDecipheriv('aes-256-ecb', NETHERNET_KEY, null);
+    cipher.setAutoPadding(true);
+    const dec = Buffer.concat([cipher.update(enc), cipher.final()]);
+    if (dec.length < 24 || dec.readUInt16LE(2) !== 1) return null;
+    const innerLen = dec.readUInt32LE(20);
+    const inner    = dec.slice(24, 24 + innerLen);
+    let pos = (inner[0] < 32) ? 0 : 1;
+    const readStr = () => {
+      if (pos >= inner.length) return '';
+      const len = inner[pos++];
+      const s   = inner.slice(pos, pos + len).toString('utf8');
+      pos += len;
+      return s;
+    };
+    const serverName = readStr();
+    const levelName  = readStr();
+    if (pos + 7 > inner.length) return null;
+    pos++; // gameType
+    const playerCount = inner.readInt32LE(pos); pos += 4;
+    const maxPlayers  = inner.readInt16LE(pos);
+    if (!serverName) return null;
+    return { serverName, levelName, playerCount, maxPlayers };
+  } catch (_) { return null; }
+}
+
+// ─── Agent ───────────────────────────────────────────────────────────────────
+
 function startAgent(config) {
-  let controlSocket = null;
-  let authenticated = false;
+  const localHost = config.localHost   || cliLocalHost;
+  const localPort = config.localUdpPort || cliLocalPort;
+  const clientId  = config.clientId    || config.clientName || 'bedrock-multi-agent';
+  const serverHost = config.serverHost  || 'mbasic7.pikamc.vn';
+  const serverPort = config.serverControlPort || 25284;
+  const reconnectMs = config.reconnectMs || 3000;
+
+  // State
+  let controlSocket  = null;
+  let authenticated  = false;
+  let myKey          = config.key || '';
+  let myRemotePort   = null;
   let reconnectTimer = null;
 
-  const localSocketsBySession = new Map();
-  const sessionLastSeen = new Map();
-  const dataSocketsBySession = new Map();
+  // UDP sessions: sessionId → localUdpSocket
+  const udpSessions   = new Map();
+  // UDP control channel socket (same server addr, server port)
+  let udpCtrlConn = null;
+  let udpReady    = false;
+  let udpPingTimer = null;
 
-  // --- PERSISTENT EXPLORER ---
-  const explorer = dgram.createSocket("udp4");
+  // ── NetherNet explorer ────────────────────────────────────────────────
+  const explorer = dgram.createSocket('udp4');
   let worldActive = false;
   let lastWorldUpdate = 0;
 
-  function sendDiscoveryPing() {
-    try {
-      const body = Buffer.concat([
-        Buffer.from([0x00, 0x00]), // ptype = 0 (Discovery Request)
-        Buffer.alloc(8),           // guid placeholder
-        Buffer.alloc(8)            // padding
-      ]);
-      body.writeBigUInt64LE(EXPLORER_GUID, 2);
-      const raw = Buffer.concat([Buffer.from([0x14, 0x00]), body]);
-      const hmac = crypto.createHmac('sha256', NETHERNET_KEY);
-      const checksum = hmac.update(raw).digest();
-      const cipher = crypto.createCipheriv('aes-256-ecb', NETHERNET_KEY, null);
-      cipher.setAutoPadding(true);
-      const encrypted = Buffer.concat([cipher.update(raw), cipher.final()]);
-      explorer.send(Buffer.concat([checksum, encrypted]), cliPort, cliHost);
-    } catch (e) {}
-  }
-
-  explorer.on("message", (payload) => {
-    if (payload.length < 34) return;
-    try {
-      const encrypted = payload.subarray(32);
-      const decipher = crypto.createDecipheriv('aes-256-ecb', NETHERNET_KEY, null);
-      decipher.setAutoPadding(true);
-      const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-      if (decrypted.length >= 24 && decrypted.readUInt16LE(2) === 1) { 
-          const innerLen = decrypted.readUInt32LE(20); 
-          const inner = decrypted.subarray(24, 24 + innerLen);
-          let pos = inner[0] < 32 ? 0 : 1; 
-          const readStr = () => {
-             if (pos >= inner.length) return "";
-             const len = inner[pos++];
-             const str = inner.subarray(pos, pos + len).toString('utf8');
-             pos += len; return str;
-          };
-          const sName = readStr();
-          const lName = readStr();
-          if (pos + 7 > inner.length) return;
-          pos++; // skip gameType
-          const pCount = inner.readInt32LE(pos); pos += 4;
-          const pMax = inner.readInt16LE(pos); pos += 2;
-          if (sName && (!worldActive || Date.now() - lastWorldUpdate > 30000)) {
-            console.log(`\n\x1b[35m[OMLET]\x1b[0m Hosting: \x1b[1m\x1b[32m${sName}\x1b[0m (\x1b[33m${pCount}/${pMax}\x1b[0m)`);
-            worldActive = true;
-            lastWorldUpdate = Date.now();
-            if (controlSocket && authenticated) {
-              controlSocket.write(encodeJson({ type: "WORLD_INFO", serverName: sName, levelName: lName, playerCount: pCount, maxPlayers: pMax }));
-            }
-          }
-      }
-    } catch (e) {}
-  });
-
-  setInterval(sendDiscoveryPing, 2000);
-  
-  function createDataConnection(sessionId, localPort) {
-    const dataSocket = (config.useTLS ? tls : net).connect({ host: config.serverHost, port: config.serverControlPort }, () => {
-      dataSocket.write(encodeDataInit(sessionId));
-      console.log(`[DataConn] Session ${sessionId} opened.`);
-    });
-    
-    dataSocketsBySession.set(sessionId, dataSocket);
-    
-    const parser = createBinaryParser((msg) => {
-      if (msg.type === "UDP_TO_AGENT") {
-        sessionLastSeen.set(sessionId, Date.now());
-        const local = getOrCreateLocalSocket(sessionId, localPort);
-        local.send(msg.payload, localPort, cliHost);
-      }
-    }, (err) => {
-      dataSocket.destroy();
-    });
-    
-    dataSocket.on("data", parser);
-    dataSocket.on("close", () => {
-      dataSocketsBySession.delete(sessionId);
-      const local = localSocketsBySession.get(sessionId);
-      if (local) {
-        local.close();
-        localSocketsBySession.delete(sessionId);
-      }
-    });
-    
-    return dataSocket;
-  }
-
-  function getOrCreateLocalSocket(sessionId, port) {
-    let localSocket = localSocketsBySession.get(sessionId);
-    if (localSocket) return localSocket;
-    localSocket = dgram.createSocket("udp4");
-    localSocket.on("message", (payload) => {
-      const dataConn = dataSocketsBySession.get(sessionId);
-      if (!dataConn) return;
-      sessionLastSeen.set(sessionId, Date.now());
-      dataConn.write(encodeUdpFromAgent(sessionId, payload));
-    });
-    localSocketsBySession.set(sessionId, localSocket);
-    return localSocket;
-  }
-
-  function connectControl() {
-    const socket = (config.useTLS ? tls : net).connect({ host: config.serverHost, port: config.serverControlPort }, () => {
-      console.log(`\x1b[36mKami Tunnel Active\x1b[0m -> Routing to ${cliHost}:${cliPort} (${cliProto})`);
-      socket.write(encodeJson({ type: "AUTH", token: config.authToken, clientName: config.clientName || "multi-host" }));
-    });
-    socket.on("error", () => {});
-    controlSocket = socket;
-    const parseChunk = createBinaryParser((msg) => {
-      if (msg.type === "JSON") {
-        if (msg.payload.type === "AUTH_OK") { authenticated = true; console.log("\x1b[32mTunnel Ready!\x1b[0m"); }
-        if (msg.payload.type === "PING") socket.write(encodeJson({ type: "PONG" }));
-      } else if (msg.type === "CONTROL_REQUEST_DATA") {
-        if (!authenticated) return;
-        createDataConnection(msg.sessionId, msg.localPort);
-      } else if (msg.type === "UDP_TO_AGENT") {
-        // Fallback for non-data connection multiplexing if server still sends it
-        sessionLastSeen.set(msg.sessionId, Date.now());
-        const local = getOrCreateLocalSocket(msg.sessionId, msg.localPort);
-        local.send(msg.payload, msg.localPort, cliHost);
-      }
-    }, (err) => socket.destroy());
-    socket.on("data", parseChunk);
-    socket.on("close", () => {
-      authenticated = false;
-      setTimeout(connectControl, 3000);
-    });
-  }
-
-  setInterval(() => {
-    const now = Date.now();
-    for (const [sid, last] of sessionLastSeen) {
-      if (now - last > 60000) {
-        const s = localSocketsBySession.get(sid);
-        if (s) s.close();
-        localSocketsBySession.delete(sid);
-        sessionLastSeen.delete(sid);
+  explorer.on('message', (buf) => {
+    const info = parseDiscoveryResponse(buf);
+    if (!info) return;
+    if (!worldActive || Date.now() - lastWorldUpdate > 30000) {
+      worldActive     = true;
+      lastWorldUpdate = Date.now();
+      console.log(`\n\x1b[35m[World]\x1b[0m \x1b[1m\x1b[32m${info.serverName}\x1b[0m (\x1b[33m${info.playerCount}/${info.maxPlayers}\x1b[0m)`);
+      if (controlSocket && authenticated) {
+        controlSocket.write(encodeControl({
+          type: 'world_info',
+          serverName: info.serverName,
+          levelName:  info.levelName,
+          playerCount: info.playerCount,
+          maxPlayers:  info.maxPlayers,
+        }));
       }
     }
-  }, 10000);
+  });
+  explorer.on('error', () => {});
+
+  function sendDiscoveryPing() {
+    try { explorer.send(buildDiscoveryPing(), localPort, localHost); } catch (_) {}
+  }
+  setInterval(sendDiscoveryPing, 2000);
+
+  // ── UDP Control Channel ───────────────────────────────────────────────
+
+  function setupUDPChannel() {
+    if (udpCtrlConn) {
+      try { udpCtrlConn.close(); } catch (_) {}
+    }
+    udpReady = false;
+
+    const sock = dgram.createSocket('udp4');
+    udpCtrlConn = sock;
+
+    sock.on('message', (buf) => {
+      const parsed = parseUDPMessage(buf);
+      if (!parsed || parsed.key !== myKey) return;
+
+      switch (parsed.msgType) {
+        case UDP_MSG.HANDSHAKE:
+          if (!udpReady) {
+            udpReady = true;
+            console.log('\x1b[32m[UDP]\x1b[0m Control channel handshake OK');
+            startUDPPing();
+          }
+          break;
+        case UDP_MSG.DATA: {
+          // Server → us: data for session parsed.id → send to local game
+          const sess = udpSessions.get(parsed.id);
+          if (sess && parsed.payload.length > 0) {
+            sess.send(parsed.payload, localPort, localHost);
+          }
+          break;
+        }
+        case UDP_MSG.CLOSE:
+          closeUDPSession(parsed.id);
+          break;
+        case UDP_MSG.PING:
+          sock.send(
+            buildUDPMessage(UDP_MSG.PONG, myKey, parsed.id, parsed.payload),
+            serverPort, serverHost
+          );
+          break;
+        case UDP_MSG.PONG:
+          // just keep-alive received
+          break;
+      }
+    });
+    sock.on('error', () => {});
+
+    // Send handshake bursts
+    for (let i = 0; i < 3; i++) {
+      setTimeout(() => {
+        if (udpCtrlConn !== sock) return;
+        sock.send(buildUDPMessage(UDP_MSG.HANDSHAKE, myKey, '', null), serverPort, serverHost);
+      }, i * 50);
+    }
+
+    // Retry handshake if not acked
+    let retries = 0;
+    const retryTimer = setInterval(() => {
+      if (udpReady || udpCtrlConn !== sock) { clearInterval(retryTimer); return; }
+      if (++retries > 20) {
+        clearInterval(retryTimer);
+        console.warn('\x1b[31m[UDP]\x1b[0m Handshake timeout after 20 retries');
+        return;
+      }
+      sock.send(buildUDPMessage(UDP_MSG.HANDSHAKE, myKey, '', null), serverPort, serverHost);
+    }, 500);
+  }
+
+  function startUDPPing() {
+    if (udpPingTimer) clearInterval(udpPingTimer);
+    udpPingTimer = setInterval(() => {
+      if (!udpCtrlConn || !myKey) return;
+      const ts = Buffer.allocUnsafe(8);
+      ts.writeBigInt64BE(BigInt(Date.now()), 0);
+      udpCtrlConn.send(
+        buildUDPMessage(UDP_MSG.PING, myKey, '', ts),
+        serverPort, serverHost
+      );
+    }, 3000);
+  }
+
+  // ── UDP session per player (udp_open) ─────────────────────────────────
+
+  function handleUDPOpen(msg) {
+    if (udpSessions.has(msg.id)) closeUDPSession(msg.id);
+
+    const sock = dgram.createSocket('udp4');
+    udpSessions.set(msg.id, sock);
+
+    sock.on('message', (buf) => {
+      // Data from local game → forward to server via UDP data channel
+      if (!udpCtrlConn || !udpReady) return;
+      udpCtrlConn.send(
+        buildUDPMessage(UDP_MSG.DATA, myKey, msg.id, buf),
+        serverPort, serverHost
+      );
+    });
+    sock.on('error', () => closeUDPSession(msg.id));
+
+    console.log(`\x1b[34m[UDP Open]\x1b[0m Session \x1b[33m${msg.id}\x1b[0m from ${msg.remote_addr}`);
+  }
+
+  function closeUDPSession(id) {
+    const sock = udpSessions.get(id);
+    if (sock) {
+      try { sock.close(); } catch (_) {}
+      udpSessions.delete(id);
+      console.log(`\x1b[31m[UDP Close]\x1b[0m Session ${id}`);
+    }
+  }
+
+  // ── TCP proxy (handleProxy) ───────────────────────────────────────────
+
+  function handleProxy(id) {
+    // Open new TCP conn to server with proxy handshake
+    const srvConn = net.connect({ host: serverHost, port: serverPort }, () => {
+      srvConn.setNoDelay(true);
+      srvConn.write(encodeControl({
+        type: 'proxy',
+        key: myKey,
+        client_id: clientId,
+        id,
+      }));
+
+      // Open conn to local backend
+      const localConn = net.connect({ host: localHost, port: localPort }, () => {
+        localConn.setNoDelay(true);
+        srvConn.pipe(localConn);
+        localConn.pipe(srvConn);
+        srvConn.on('close', () => localConn.destroy());
+        localConn.on('close', () => srvConn.destroy());
+        srvConn.on('error', () => localConn.destroy());
+        localConn.on('error', () => srvConn.destroy());
+      });
+      localConn.on('error', (e) => {
+        console.error(`\x1b[31m[TCP]\x1b[0m Local connect failed: ${e.message}`);
+        srvConn.destroy();
+      });
+    });
+    srvConn.on('error', (e) => {
+      console.error(`\x1b[31m[TCP]\x1b[0m Server data-conn failed: ${e.message}`);
+    });
+  }
+
+  // ── Control Connection ────────────────────────────────────────────────
+
+  function connectControl() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
+    const socket = net.connect({ host: serverHost, port: serverPort }, () => {
+      socket.setNoDelay(true);
+      console.log(`\x1b[36m[Control]\x1b[0m Connected → ${serverHost}:${serverPort}`);
+
+      // Send register
+      socket.write(encodeControl({
+        type:      'register',
+        key:       myKey,
+        client_id: clientId,
+        target:    `${localHost}:${localPort}`,
+        protocol:  cliProto,
+      }));
+    });
+
+    controlSocket = socket;
+
+    const parser = createLineParser((msg) => {
+      switch (msg.type) {
+        case 'registered':
+          myKey         = msg.key || myKey;
+          myRemotePort  = msg.remote_port;
+          authenticated = true;
+          console.log(`\x1b[32m[Registered]\x1b[0m key=${myKey} remote_port=${myRemotePort} proto=${msg.protocol}`);
+          // Start UDP channel after registration
+          if (msg.protocol === 'udp' || cliProto === 'udp') {
+            setupUDPChannel();
+          }
+          break;
+
+        case 'proxy':
+          if (!authenticated) break;
+          console.log(`\x1b[34m[Proxy]\x1b[0m ${msg.id}`);
+          handleProxy(msg.id);
+          break;
+
+        case 'udp_open':
+          if (!authenticated) break;
+          handleUDPOpen(msg);
+          break;
+
+        case 'udp_close':
+          closeUDPSession(msg.id);
+          break;
+
+        case 'ping':
+          socket.write(encodeControl({ type: 'pong' }));
+          break;
+
+        case 'pong':
+          break;
+
+        case 'error':
+          console.error(`\x1b[31m[Server Error]\x1b[0m ${msg.error}`);
+          break;
+
+        default:
+          console.log(`[Control? Unknown] ${JSON.stringify(msg)}`);
+      }
+    }, (err) => socket.destroy());
+
+    socket.on('data', parser);
+
+    socket.on('close', () => {
+      authenticated = false;
+      udpReady      = false;
+      if (udpPingTimer) { clearInterval(udpPingTimer); udpPingTimer = null; }
+      if (udpCtrlConn) { try { udpCtrlConn.close(); } catch (_) {} udpCtrlConn = null; }
+      console.log('\x1b[31m[Control]\x1b[0m Disconnected. Reconnecting...');
+      reconnectTimer = setTimeout(connectControl, reconnectMs);
+    });
+
+    socket.on('error', () => {});
+  }
 
   connectControl();
 }
 
-const config = loadConfig(process.argv[2] || "configs/agent.config.json");
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+const configPath = process.argv[2] || 'configs/agent.config.json';
+const config     = loadConfig(configPath);
 startAgent(config);

@@ -1,11 +1,8 @@
 {
   "serverHost": "mbasic7.pikamc.vn",
   "serverControlPort": 25284,
-  "authToken": "CHANGE_ME_STRONG_TOKEN",
-  "clientName": "bedrock-multi-agent",
+  "clientId": "bedrock-host-1",
   "localHost": "127.0.0.1",
-  "localUdpPort": 7551,
-  "reconnectMs": 3000,
-  "maintenanceIntervalMs": 10000,
-  "sessionIdleTimeoutMs": 60000
+  "localUdpPort": 19132,
+  "reconnectMs": 3000
 }

@@ -2,20 +2,19 @@
   "publicBindAddr": "0.0.0.0",
   "controlBindAddr": "0.0.0.0",
   "controlPort": 25284,
-  "authToken": "CHANGE_ME_STRONG_TOKEN",
+  "pingIntervalMs": 20000,
+  "pongTimeoutMs": 45000,
+  "proxyTimeoutMs": 10000,
   "ports": [
     {
       "publicPort": 25294,
-      "localPort": 7551,
-      "agentName": "bedrock-multi-agent"
+      "clientId": "bedrock-host-1",
+      "protocol": "udp"
     },
     {
       "publicPort": 25296,
-      "localPort": 7551,
-      "agentName": "bedrock-multi-agent"
+      "clientId": "bedrock-host-2",
+      "protocol": "udp"
     }
-  ],
-  "maintenanceIntervalMs": 10000,
-  "sessionIdleTimeoutMs": 60000,
-  "agentPongTimeoutMs": 45000
+  ]
 }
