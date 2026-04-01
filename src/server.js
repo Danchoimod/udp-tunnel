@@ -176,7 +176,7 @@ function startServer(config) {
           buildUDPMessage(UDP_MSG.HANDSHAKE, parsed.key, '', null),
           rinfo.port, rinfo.address
         );
-        console.log(`\x1b[32m[UDP Linked]\x1b[0m client_id=${client.clientId} via ${rinfo.address}:${rinfo.port}`);
+        console.log(`\x1b[32m[UDP Linked]\x1b[0m client_id=${client.portMapping.clientId} via ${rinfo.address}:${rinfo.port}`);
         break;
 
       case UDP_MSG.DATA: {
