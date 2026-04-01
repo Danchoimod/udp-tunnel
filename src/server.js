@@ -101,8 +101,16 @@ function startServer(config) {
 
     sock.on('message', (msg, rinfo) => {
       const remoteAddr = `${rinfo.address}:${rinfo.port}`;
-      const client     = clients.get(portMapping.clientId);
-      if (!client) return; // no agent connected
+      console.log(`\x1b[33m[UDP :${publicPort}]\x1b[0m Packet from ${remoteAddr} (${msg.length}B)`);
+      const client = clients.get(portMapping.clientId);
+      if (!client) {
+        console.warn(`\x1b[31m[UDP :${publicPort}]\x1b[0m No agent for client_id: ${portMapping.clientId}`);
+        return;
+      }
+      if (!client.udpConn) {
+        console.warn(`\x1b[31m[UDP :${publicPort}]\x1b[0m Agent has no UDP channel yet (handshake pending?)`);
+        return;
+      }
 
       // Find existing session for this remoteAddr+port
       let sessionId = null;
@@ -379,8 +387,9 @@ function startServer(config) {
     }
   }, pingIntervalMs);
 
-  // ── Dashboard ──────────────────────────────────────────────────────────
-  setInterval(() => renderDashboard(config, clients, pendingTcp, udpSessions), 1000);
+  // Dashboard (disabled temporarily for debug — re-enable after confirming tunnel works)
+  // setInterval(() => renderDashboard(config, clients, pendingTcp, udpSessions), 1000);
+  console.log('\x1b[32m[Server Ready]\x1b[0m Debug mode: watching for UDP packets...');
 }
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
