@@ -155,16 +155,19 @@ function startServer(config) {
 
     // Find client by key
     let foundClient = null;
-    let foundId     = null;
-    for (const [id, c] of clients) {
-      if (c.key === parsed.key) { foundClient = c; foundId = id; break; }
+    let client = null;
+    for (const c of clients.values()) {
+      if (c.key === parsed.key) {
+        client = c;
+        break;
+      }
     }
-    if (!foundClient) return;
+    if (!client) return;
 
-    // Track client UDP address
-    foundClient.udpAddr = rinfo.address;
-    foundClient.udpPort = rinfo.port;
-    foundClient.udpConn = udpCtrl;
+    // Update agent UDP address dynamically (Dynamic NAT support)
+    client.udpAddr = rinfo.address;
+    client.udpPort = rinfo.port;
+    client.udpConn = udpCtrl;
 
     switch (parsed.msgType) {
       case UDP_MSG.HANDSHAKE:
@@ -173,7 +176,7 @@ function startServer(config) {
           buildUDPMessage(UDP_MSG.HANDSHAKE, parsed.key, '', null),
           rinfo.port, rinfo.address
         );
-        console.log(`\x1b[34m[UDP Handshake]\x1b[0m Client ${foundId} from ${rinfo.address}:${rinfo.port}`);
+        console.log(`\x1b[32m[UDP Linked]\x1b[0m client_id=${client.clientId} via ${rinfo.address}:${rinfo.port}`);
         break;
 
       case UDP_MSG.DATA: {
