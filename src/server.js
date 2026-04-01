@@ -110,6 +110,8 @@ function startServer(config) {
   const sessionByRemote = new Map();
   const remoteBySession = new Map();
   const sessionLastSeen = new Map();
+  const dataConnections = new Map(); 
+  const sessionQueues = new Map(); 
 
   function cleanupSession(sessionId) {
     const remote = remoteBySession.get(sessionId);
@@ -117,6 +119,13 @@ function startServer(config) {
     sessionByRemote.delete(sessionKey(remote.address, remote.port, remote.localPort));
     remoteBySession.delete(sessionId);
     sessionLastSeen.delete(sessionId);
+    
+    const conn = dataConnections.get(sessionId);
+    if (conn) {
+      conn.destroy();
+      dataConnections.delete(sessionId);
+    }
+    sessionQueues.delete(sessionId);
   }
 
   function cleanupAgentSessions(agentName) {
@@ -162,8 +171,21 @@ function startServer(config) {
       
       const targetName = portMapping.agentName || "default";
       const agent = agents.get(targetName);
-      if (agent) {
-        agent.socket.write(encodeUdpToAgent(sessionId, localPort, payload));
+      if (!agent) return;
+
+      const dataConn = dataConnections.get(sessionId);
+      if (dataConn) {
+        dataConn.write(encodeUdpToAgent(sessionId, localPort, payload));
+      } else {
+        // Request a new data connection if not already pending
+        if (!sessionQueues.has(sessionId)) {
+          sessionQueues.set(sessionId, []);
+          agent.socket.write(encodeControlRequest(sessionId, localPort));
+        }
+        
+        // Queue packet
+        const queue = sessionQueues.get(sessionId);
+        if (queue.length < 100) queue.push(payload);
       }
     });
 
@@ -178,7 +200,7 @@ function startServer(config) {
     const parseChunk = createBinaryParser((msg) => {
       if (msg.type === "JSON") {
         const payload = msg.payload;
-        if (!socket.agentName) {
+        if (!socket.agentName && !socket.isDataConn) {
           if (payload.type === "AUTH" && payload.token === config.authToken) {
             const clientName = payload.clientName || "default";
             const existing = agents.get(clientName);
@@ -199,6 +221,8 @@ function startServer(config) {
           return;
         }
 
+        if (socket.isDataConn) return; // Data connections don't handle PING/WORLD_INFO here
+
         if (payload.type === "PONG") {
           const agent = agents.get(socket.agentName);
           if (agent) agent.lastPongAt = Date.now();
@@ -214,6 +238,24 @@ function startServer(config) {
           const socketToUse = udpSockets.get(remote.publicPort);
           if (socketToUse) socketToUse.send(msg.payload, remote.port, remote.address);
         }
+      } else if (msg.type === "DATA_INIT") {
+        const sessionId = msg.sessionId;
+        const remote = remoteBySession.get(sessionId);
+        if (remote) {
+          socket.isDataConn = true;
+          socket.sessionId = sessionId;
+          dataConnections.set(sessionId, socket);
+          
+          // Send queued packets
+          const queue = sessionQueues.get(sessionId);
+          if (queue) {
+            queue.forEach(p => socket.write(encodeUdpToAgent(sessionId, remote.localPort, p)));
+            sessionQueues.delete(sessionId);
+          }
+          console.log(`[DataConn] Session ${sessionId} linked.`);
+        } else {
+          socket.destroy();
+        }
       }
     }, (err) => {
       socket.destroy();
@@ -222,6 +264,10 @@ function startServer(config) {
     socket.on("data", parseChunk);
     socket.on("close", () => {
       if (socket._replaced) return;
+      if (socket.isDataConn && socket.sessionId) {
+        dataConnections.delete(socket.sessionId);
+        return;
+      }
       if (socket.agentName && agents.get(socket.agentName)?.socket === socket) {
         const agentName = socket.agentName;
         agents.delete(agentName);

@@ -5,6 +5,8 @@ const PACKET_TYPES = {
   JSON: 0x01,
   UDP_TO_AGENT: 0x02,
   UDP_FROM_AGENT: 0x03,
+  CONTROL_REQUEST_DATA: 0x04,
+  DATA_INIT: 0x05,
 };
 
 function encodeJson(message) {
@@ -30,6 +32,27 @@ function encodeUdpToAgent(sessionIdHex, localPort, payload) {
   sessionBuf.copy(packet, MAGIC_LEN + 4 + 1);
   packet.writeUInt16BE(localPort, MAGIC_LEN + 4 + 1 + sessionBuf.length);
   payload.copy(packet, MAGIC_LEN + 4 + 1 + sessionBuf.length + 2);
+  return packet;
+}
+
+function encodeControlRequest(sessionIdHex, localPort) {
+  const sessionBuf = Buffer.from(sessionIdHex, "hex");
+  const packet = Buffer.allocUnsafe(MAGIC_LEN + 4 + 1 + sessionBuf.length + 2);
+  MAGIC.copy(packet, 0);
+  packet.writeUInt32BE(1 + sessionBuf.length + 2, MAGIC_LEN);
+  packet.writeUInt8(PACKET_TYPES.CONTROL_REQUEST_DATA, MAGIC_LEN + 4);
+  sessionBuf.copy(packet, MAGIC_LEN + 4 + 1);
+  packet.writeUInt16BE(localPort, MAGIC_LEN + 4 + 1 + sessionBuf.length);
+  return packet;
+}
+
+function encodeDataInit(sessionIdHex) {
+  const sessionBuf = Buffer.from(sessionIdHex, "hex");
+  const packet = Buffer.allocUnsafe(MAGIC_LEN + 4 + 1 + sessionBuf.length);
+  MAGIC.copy(packet, 0);
+  packet.writeUInt32BE(1 + sessionBuf.length, MAGIC_LEN);
+  packet.writeUInt8(PACKET_TYPES.DATA_INIT, MAGIC_LEN + 4);
+  sessionBuf.copy(packet, MAGIC_LEN + 4 + 1);
   return packet;
 }
 
@@ -105,6 +128,17 @@ function createBinaryParser(onMessage, onError) {
             sessionId: data.slice(0, 8).toString('hex'),
             payload: data.slice(8),
           });
+        } else if (type === PACKET_TYPES.CONTROL_REQUEST_DATA) {
+          onMessage({
+            type: 'CONTROL_REQUEST_DATA',
+            sessionId: data.slice(0, 8).toString('hex'),
+            localPort: data.readUInt16BE(8),
+          });
+        } else if (type === PACKET_TYPES.DATA_INIT) {
+          onMessage({
+            type: 'DATA_INIT',
+            sessionId: data.slice(0, 8).toString('hex'),
+          });
         }
       } catch (err) {
         onError(err);
@@ -118,5 +152,7 @@ module.exports = {
   encodeJson,
   encodeUdpToAgent,
   encodeUdpFromAgent,
+  encodeControlRequest,
+  encodeDataInit,
   createBinaryParser,
 };

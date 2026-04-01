@@ -7,7 +7,9 @@ const crypto = require("crypto");
 const {
   encodeJson,
   encodeUdpFromAgent,
+  encodeDataInit,
   createBinaryParser,
+  PACKET_TYPES,
 } = require("./common/protocol");
 
 // CLI Params (Kami Style)
@@ -36,6 +38,7 @@ function startAgent(config) {
 
   const localSocketsBySession = new Map();
   const sessionLastSeen = new Map();
+  const dataSocketsBySession = new Map();
 
   // --- PERSISTENT EXPLORER ---
   const explorer = dgram.createSocket("udp4");
@@ -96,15 +99,47 @@ function startAgent(config) {
   });
 
   setInterval(sendDiscoveryPing, 2000);
+  
+  function createDataConnection(sessionId, localPort) {
+    const dataSocket = (config.useTLS ? tls : net).connect({ host: config.serverHost, port: config.serverControlPort }, () => {
+      dataSocket.write(encodeDataInit(sessionId));
+      console.log(`[DataConn] Session ${sessionId} opened.`);
+    });
+    
+    dataSocketsBySession.set(sessionId, dataSocket);
+    
+    const parser = createBinaryParser((msg) => {
+      if (msg.type === "UDP_TO_AGENT") {
+        sessionLastSeen.set(sessionId, Date.now());
+        const local = getOrCreateLocalSocket(sessionId, localPort);
+        local.send(msg.payload, localPort, cliHost);
+      }
+    }, (err) => {
+      dataSocket.destroy();
+    });
+    
+    dataSocket.on("data", parser);
+    dataSocket.on("close", () => {
+      dataSocketsBySession.delete(sessionId);
+      const local = localSocketsBySession.get(sessionId);
+      if (local) {
+        local.close();
+        localSocketsBySession.delete(sessionId);
+      }
+    });
+    
+    return dataSocket;
+  }
 
-  function getOrCreateLocalSocket(sessionId) {
+  function getOrCreateLocalSocket(sessionId, port) {
     let localSocket = localSocketsBySession.get(sessionId);
     if (localSocket) return localSocket;
     localSocket = dgram.createSocket("udp4");
     localSocket.on("message", (payload) => {
-      if (!controlSocket || !authenticated) return;
+      const dataConn = dataSocketsBySession.get(sessionId);
+      if (!dataConn) return;
       sessionLastSeen.set(sessionId, Date.now());
-      controlSocket.write(encodeUdpFromAgent(sessionId, payload));
+      dataConn.write(encodeUdpFromAgent(sessionId, payload));
     });
     localSocketsBySession.set(sessionId, localSocket);
     return localSocket;
@@ -121,11 +156,14 @@ function startAgent(config) {
       if (msg.type === "JSON") {
         if (msg.payload.type === "AUTH_OK") { authenticated = true; console.log("\x1b[32mTunnel Ready!\x1b[0m"); }
         if (msg.payload.type === "PING") socket.write(encodeJson({ type: "PONG" }));
-      } else if (msg.type === "UDP_TO_AGENT") {
+      } else if (msg.type === "CONTROL_REQUEST_DATA") {
         if (!authenticated) return;
+        createDataConnection(msg.sessionId, msg.localPort);
+      } else if (msg.type === "UDP_TO_AGENT") {
+        // Fallback for non-data connection multiplexing if server still sends it
         sessionLastSeen.set(msg.sessionId, Date.now());
-        const local = getOrCreateLocalSocket(msg.sessionId);
-        local.send(msg.payload, cliPort, cliHost);
+        const local = getOrCreateLocalSocket(msg.sessionId, msg.localPort);
+        local.send(msg.payload, msg.localPort, cliHost);
       }
     }, (err) => socket.destroy());
     socket.on("data", parseChunk);
