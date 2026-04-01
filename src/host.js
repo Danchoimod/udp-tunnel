@@ -235,17 +235,31 @@ function startAgent(config) {
   }
 
   // ── UDP session per player (udp_open) ─────────────────────────────────
-  // Each session gets its own UDP socket bound to a random local port, then
-  // "connected" to the local game. This mirrors Go's net.DialUDP() semantics:
-  // the socket has a fixed source port so the game always knows where to respond.
+  // Each session = one DialUDP-like socket to the local game.
+  // CRITICAL: add to map BEFORE bind() completes to avoid race condition
+  // where server sends DATA before we're ready.
 
   function handleUDPOpen(msg) {
     if (udpSessions.has(msg.id)) closeUDPSession(msg.id);
 
     const sock = dgram.createSocket({ type: 'udp4' });
+    const pending = []; // buffer packets arriving before bind completes
+    let bound = false;
+
+    // Add to map immediately — prevents race condition
+    udpSessions.set(msg.id, {
+      send(buf, port, host) {
+        if (bound) {
+          sock.send(buf, port, host);
+        } else {
+          pending.push({ buf, port, host }); // queue until bound
+        }
+      },
+      close() { try { sock.close(); } catch (_) {} },
+    });
 
     sock.on('message', (buf) => {
-      // Reply from local game → forward back to server via UDP control channel
+      // Reply from local game → forward back to server
       if (!udpCtrlConn || !udpReady) return;
       udpCtrlConn.send(
         buildUDPMessage(UDP_MSG.DATA, myKey, msg.id, buf),
@@ -255,18 +269,21 @@ function startAgent(config) {
 
     sock.on('error', () => closeUDPSession(msg.id));
 
-    // Bug 3 fix: explicitly bind to port 0 so the OS assigns a real local port.
-    // Without this, dgram may not consistently receive replies from the game.
-    sock.bind(0, localHost, () => {
-      udpSessions.set(msg.id, sock);
-      console.log(`\x1b[34m[UDP Open]\x1b[0m Session \x1b[33m${msg.id}\x1b[0m from ${msg.remote_addr} → local bound :${sock.address().port}`);
+    // Bind to port 0 on all interfaces so game replies reach us
+    sock.bind(0, () => {
+      bound = true;
+      const assignedPort = sock.address().port;
+      console.log(`\x1b[34m[UDP Open]\x1b[0m Session \x1b[33m${msg.id}\x1b[0m bound :${assignedPort} → game :${localPort}`);
+      // Flush queued packets
+      for (const p of pending) sock.send(p.buf, p.port, p.host);
+      pending.length = 0;
     });
   }
 
   function closeUDPSession(id) {
-    const sock = udpSessions.get(id);
-    if (sock) {
-      try { sock.close(); } catch (_) {}
+    const sess = udpSessions.get(id);
+    if (sess) {
+      try { sess.close(); } catch (_) {}
       udpSessions.delete(id);
       console.log(`\x1b[31m[UDP Close]\x1b[0m Session ${id}`);
     }
