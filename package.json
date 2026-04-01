@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node index.js server",
     "start:server": "node index.js server",
-    "start:agent": "node index.js agent",
+    "start:host": "node index.js host",
+    "start:agent": "node index.js host",
     "start:client": "node index.js client",
     "check": "node -e \"console.log('ok')\""
   },

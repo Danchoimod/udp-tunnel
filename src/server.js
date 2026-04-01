@@ -47,25 +47,41 @@ function renderDashboard(config, agents, sessionByRemote) {
   const timeStr = `${Math.floor(duration / 3600)}h ${Math.floor((duration % 3600) / 60)}m ${duration % 60}s`;
 
   process.stdout.write("\x1b[H\x1b[2J");
-  console.log("\x1b[36m=====================================================\x1b[0m");
+  console.log("\x1b[36m" + "=" .repeat(60) + "\x1b[0m");
   console.log("\x1b[1m\x1b[35m            BEDROCK TUNNEL SERVER DASHBOARD          \x1b[0m");
-  console.log("\x1b[36m=====================================================\x1b[0m");
+  console.log("\x1b[1m\x1b[35m                (Powered by LFLauncher)              \x1b[0m");
+  console.log("\x1b[36m" + "=" .repeat(60) + "\x1b[0m");
   console.log(` Status      : \x1b[32mRUNNING\x1b[0m`);
-  console.log(` Host        : \x1b[33m${config.publicIP || "localhost"}\x1b[0m`);
+  console.log(` Public Host : \x1b[33m${config.publicIP || "mbasic7.pikamc.vn"}\x1b[0m`);
   console.log(` Uptime      : ${timeStr}`);
   console.log(` Agents      : \x1b[33m${agents.size}\x1b[0m online`);
-  console.log(` Sessions    : \x1b[33m${sessionByRemote.size}\x1b[0m`);
-  console.log("\x1b[36m-----------------------------------------------------\x1b[0m");
+  console.log(` Sessions    : \x1b[33m${sessionByRemote.size}\x1b[0m active`);
+  console.log("\x1b[36m" + "-" .repeat(60) + "\x1b[0m");
 
-  console.log(` Control Port: \x1b[32m${config.controlPort}\x1b[0m`);
+  if (agents.size === 0) {
+    console.log(" \x1b[31m[!] No hosts connected.\x1b[0m Waiting for npm run host...");
+  } else {
+    for (const [name, agent] of agents) {
+      const world = agent.worldInfo;
+      console.log(` Host: \x1b[32m${name}\x1b[0m [%s]`, agent.socket.remoteAddress);
+      if (world) {
+        console.log(`   \x1b[35m>\x1b[0m World: \x1b[1m${world.serverName}\x1b[0m (\x1b[33m${world.playerCount}/${world.maxPlayers}\x1b[0m)`);
+        console.log(`   \x1b[35m>\x1b[0m Level: ${world.levelName}`);
+      } else {
+        console.log("   \x1b[30m(Searching for local world...)\x1b[0m");
+      }
+    }
+  }
+
+  console.log("\x1b[36m" + "-" .repeat(60) + "\x1b[0m");
   config.ports.forEach(p => {
-    console.log(` UDP Port    : \x1b[33m${p.publicPort}\x1b[0m (Public) -> Local :${p.localPort}`);
+    console.log(` \x1b[33m[Port]\x1b[0m UDP \x1b[1m${p.publicPort}\x1b[0m (Public) -> Machine: \x1b[36m${p.agentName}\x1b[0m`);
   });
 
-  console.log("\x1b[36m-----------------------------------------------------\x1b[0m");
-  console.log(` Total Upload  : \x1b[32m${formatBytes(stats.totalUp)}\x1b[0m (from Agent)`);
-  console.log(` Total Download: \x1b[31m${formatBytes(stats.totalDown)}\x1b[0m (from Remote)`);
-  console.log("\x1b[36m=====================================================\x1b[0m");
+  console.log("\x1b[36m" + "-" .repeat(60) + "\x1b[0m");
+  console.log(` Total Upload  : \x1b[32m${formatBytes(stats.totalUp)}\x1b[0m (from Hosting Machine)`);
+  console.log(` Total Download: \x1b[31m${formatBytes(stats.totalDown)}\x1b[0m (from Remote Players)`);
+  console.log("\x1b[36m" + "=" .repeat(60) + "\x1b[0m");
 }
 
 function sessionKey(address, port, localPort) {
@@ -85,16 +101,12 @@ function startServer(config) {
       cert: fs.readFileSync(path.resolve(process.cwd(), config.sslCert)),
     };
     controlServer = tls.createServer(options);
-    console.log("[CONTROL] Using TLS encryption");
   } else {
     controlServer = net.createServer();
-    console.log("[CONTROL] Using unencrypted TCP (NOT RECOMMENDED)");
   }
   
-  const udpSockets = new Map(); // localPort -> udpSocket
-
-  const agents = new Map(); // clientName -> { socket, lastPongAt }
-  
+  const udpSockets = new Map(); 
+  const agents = new Map(); 
   const sessionByRemote = new Map();
   const remoteBySession = new Map();
   const sessionLastSeen = new Map();
@@ -109,9 +121,7 @@ function startServer(config) {
 
   function cleanupAgentSessions(agentName) {
     for (const [sid, remote] of remoteBySession) {
-      if (remote.agentName === agentName) {
-        cleanupSession(sid);
-      }
+      if (remote.agentName === agentName) cleanupSession(sid);
     }
   }
 
@@ -126,7 +136,6 @@ function startServer(config) {
     return true;
   }
 
-  // Khởi tạo các cổng UDP dựa trên danh sách mapping
   config.ports.forEach(portMapping => {
     const udpSocket = dgram.createSocket("udp4");
     const publicPort = portMapping.publicPort;
@@ -142,17 +151,13 @@ function startServer(config) {
         
         sessionByRemote.set(key, sessionId);
         remoteBySession.set(sessionId, {
-          address: remoteInfo.address,
-          port: remoteInfo.port,
-          localPort: localPort,
-          publicPort: publicPort,
+          address: remoteInfo.address, port: remoteInfo.port,
+          localPort: localPort, publicPort: publicPort,
           agentName: targetAgentName
         });
-        console.log(`[UDP] New session ${sessionId} for ${key} (Public Port: ${publicPort})`);
       }
 
       stats.totalDown += payload.length;
-
       touchSession(sessionId);
       
       const targetName = portMapping.agentName || "default";
@@ -162,15 +167,10 @@ function startServer(config) {
       }
     });
 
-    udpSocket.on("error", (err) => {
-      console.error(`[UDP ${publicPort}] error:`, err.message);
-    });
-
     udpSocket.bind(publicPort, config.publicBindAddr || "0.0.0.0", () => {
-      console.log(`[UDP] Listener active on port ${publicPort} -> Local ${localPort}`);
+      console.log(`[UDP Ready] Port ${publicPort}`);
     });
 
-    // FIX: Use publicPort as key to avoid conflicts when multiple public ports map to the same localPort
     udpSockets.set(publicPort, udpSocket);
   });
 
@@ -183,21 +183,17 @@ function startServer(config) {
             const clientName = payload.clientName || "default";
             const existing = agents.get(clientName);
             if (existing) {
-              console.log(`Replacing existing agent connection: ${clientName}`);
               existing.socket._replaced = true;
               existing.socket.destroy();
             }
-            
             socket.agentName = clientName;
             agents.set(clientName, {
               socket: socket,
-              lastPongAt: Date.now()
+              lastPongAt: Date.now(),
+              worldInfo: null
             });
-            
             socket.write(encodeJson({ type: "AUTH_OK" }));
-            console.log(`Agent "${clientName}" authorized`);
           } else {
-            socket.write(encodeJson({ type: "AUTH_FAIL", reason: "AUTH_FAILED" }));
             socket.destroy();
           }
           return;
@@ -206,48 +202,37 @@ function startServer(config) {
         if (payload.type === "PONG") {
           const agent = agents.get(socket.agentName);
           if (agent) agent.lastPongAt = Date.now();
-        } else if (payload.type === "STATUS" && payload.status === "WORLD_OK") {
-          console.log(`\x1b[32m[WORLD]\x1b[0m Bedrock world connection confirmed from agent "${socket.agentName}" (Session: ${payload.sessionId})`);
+        } else if (payload.type === "WORLD_INFO") {
+          const agent = agents.get(socket.agentName);
+          if (agent) agent.worldInfo = payload;
         }
       } else if (msg.type === "UDP_FROM_AGENT") {
         const remote = remoteBySession.get(msg.sessionId);
         if (remote) {
           touchSession(msg.sessionId);
           stats.totalUp += msg.payload.length;
-          // FIX: Look up by publicPort instead of localPort
           const socketToUse = udpSockets.get(remote.publicPort);
-          if (socketToUse) {
-            socketToUse.send(msg.payload, remote.port, remote.address);
-          }
+          if (socketToUse) socketToUse.send(msg.payload, remote.port, remote.address);
         }
       }
     }, (err) => {
-      console.error("Control error:", err.message);
       socket.destroy();
     });
 
     socket.on("data", parseChunk);
-    socket.on("error", (err) => {
-      console.error(`Agent socket error ("${socket.agentName || 'unauthorized'}"):`, err.message);
-    });
     socket.on("close", () => {
       if (socket._replaced) return;
       if (socket.agentName && agents.get(socket.agentName)?.socket === socket) {
         const agentName = socket.agentName;
         agents.delete(agentName);
         cleanupAgentSessions(agentName);
-        console.warn(`Agent "${agentName}" disconnected, sessions cleared`);
       }
     });
   }
 
-  controlServer.listen(config.controlPort, config.controlBindAddr || "0.0.0.0", () => {
-    console.log(`[CONTROL] Server active on port ${config.controlPort}`);
-  });
-
+  controlServer.listen(config.controlPort, config.controlBindAddr || "0.0.0.0");
   controlServer.on("connection", setupAgentSocket);
 
-  // Bảo trì session
   setInterval(() => {
     const now = Date.now();
     for (const [sid, last] of sessionLastSeen) {
@@ -255,7 +240,6 @@ function startServer(config) {
     }
     for (const [name, agent] of agents) {
       if (now - agent.lastPongAt > (config.agentPongTimeoutMs || 45000)) {
-        console.warn(`Agent "${name}" timeout`);
         agent.socket.destroy();
       } else {
         sendToAgent(name, { type: "PING" });
