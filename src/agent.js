@@ -3,11 +3,15 @@ const net = require("net");
 const tls = require("tls");
 const dgram = require("dgram");
 const path = require("path");
+const crypto = require("crypto");
 const {
   encodeJson,
   encodeUdpFromAgent,
   createBinaryParser,
 } = require("./common/protocol");
+
+// NetherNet constant key
+const NETHERNET_KEY = crypto.createHash('sha256').update(Buffer.from([0xEF, 0xBE, 0xAD, 0xDE, 0x00, 0x00, 0x00, 0x00])).digest();
 
 function loadConfig(configPath) {
   try {
@@ -58,12 +62,70 @@ function startAgent(config) {
 
     const host = config.localUdpHost || config.localHost || "127.0.0.1";
     localSocket = dgram.createSocket("udp4");
-    localSocket.targetPort = config.localUdpPort || localPort;
+    // Prioritize port sent from server over local config
+    localSocket.targetPort = localPort || config.localUdpPort || 19132;
     localSocket.targetHost = host;
+    localSocket.sessionId = sessionId; // Store for logging
 
     localSocket.on("message", (payload) => {
       if (!controlSocket || !authenticated) return;
       touchSession(sessionId);
+
+      // --- Báo cáo trạng thái kết nối thế giới ---
+      if (!localSocket.worldReady) {
+        localSocket.worldReady = true;
+        console.log(`\x1b[32m[WORLD]\x1b[0m Connection to Bedrock host world established!`);
+        controlSocket.write(encodeJson({ type: "STATUS", status: "WORLD_OK", sessionId: sessionId }));
+      }
+      
+      // --- Bedrock Discovery Sniffer (Full NetherNet Decoder) ---
+      if (payload.length > 34) {
+        try {
+          const encrypted = payload.subarray(32);
+          if (encrypted.length % 16 === 0) {
+            const decipher = crypto.createDecipheriv('aes-256-ecb', NETHERNET_KEY, null);
+            decipher.setAutoPadding(false);
+            const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+            
+            if (decrypted.length >= 20) {
+              const ptype = decrypted.readUInt16LE(2);
+              if (ptype === 1) { // Discovery Response (Pong)
+                let pos = 20; // Skip 20 bytes header
+                const inner = decrypted.subarray(pos);
+                
+                // Helper để đọc string kiểu Bedrock: [1 byte len][data]
+                let offset = 0;
+                const version = inner[offset++];
+                
+                const readStr = () => {
+                   const len = inner[offset++];
+                   const str = inner.subarray(offset, offset + len).toString('utf8');
+                   offset += len;
+                   return str;
+                };
+
+                const serverName = readStr();
+                const levelName = readStr();
+                const gameType = inner[offset++];
+                const playerCount = inner.readInt32LE(offset); offset += 4;
+                const maxPlayerCount = inner.readInt16LE(offset); offset += 2;
+
+                console.log("\n\x1b[35m" + "=" .repeat(45));
+                console.log("\x1b[1m\x1b[33m           TÌM THẤY BEDROCK WORLD!          \x1b[0m");
+                console.log("\x1b[35m" + "=" .repeat(45));
+                console.log(` \x1b[32m>\x1b[0m Tên Server     : \x1b[1m${serverName}\x1b[0m`);
+                console.log(` \x1b[32m>\x1b[0m Thế giới       : \x1b[36m${levelName}\x1b[0m`);
+                console.log(` \x1b[32m>\x1b[0m Chế độ chơi    : ${gameType === 1 ? "Creative" : "Survival"}`);
+                console.log(` \x1b[32m>\x1b[0m Người chơi     : \x1b[33m${playerCount}/${maxPlayerCount}\x1b[0m`);
+                console.log(` \x1b[32m>\x1b[0m Bedrock ID (Pt): \x1b[35m${decrypted.slice(4, 12).toString('hex')}\x1b[0m`); // Log the actual NetherNet GUID
+                console.log(` \x1b[32m>\x1b[0m Tunnel Session : ${sessionId.substring(0,8)}`);
+                console.log("\x1b[35m" + "=" .repeat(45) + "\x1b[0m\n");
+              }
+            }
+          }
+        } catch (e) {}
+      }
+
       controlSocket.write(encodeUdpFromAgent(sessionId, payload));
     });
 
@@ -114,11 +176,11 @@ function startAgent(config) {
         const localSocket = getOrCreateLocalSocket(sessionId, localPort);
         if (localSocket) {
           if (!localSocket.logged) {
-            console.log(`[UDP] New session ${sessionId.substring(0,8)}... for port ${localSocket.targetPort}`);
+            console.log(`[UDP] New session ${sessionId.substring(0,8)}... -> sending to ${localSocket.targetHost}:${localSocket.targetPort}`);
             localSocket.logged = true;
           }
           localSocket.send(payload, localSocket.targetPort, localSocket.targetHost, (err) => {
-            if (err) console.error(`[UDP] Error sending to local:`, err.message);
+            if (err) console.error(`[UDP] Error sending to local (${localSocket.targetHost}:${localSocket.targetPort}):`, err.message);
           });
         }
       }

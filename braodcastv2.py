@@ -113,7 +113,7 @@ def nethernet_decode(packet):
 
 # --- CORE LOOP ---
 def run_query():
-    broadcast_ip = '255.255.255.255'
+    broadcast_ip = '127.0.0.1'
     print(f'--- ĐANG KHÔI PHỤC KHẢ NĂNG QUÉT LAN ({broadcast_ip}) ---')
     
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)

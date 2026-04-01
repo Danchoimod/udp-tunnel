@@ -170,7 +170,8 @@ function startServer(config) {
       console.log(`[UDP] Listener active on port ${publicPort} -> Local ${localPort}`);
     });
 
-    udpSockets.set(localPort, udpSocket);
+    // FIX: Use publicPort as key to avoid conflicts when multiple public ports map to the same localPort
+    udpSockets.set(publicPort, udpSocket);
   });
 
   function setupAgentSocket(socket) {
@@ -205,13 +206,16 @@ function startServer(config) {
         if (payload.type === "PONG") {
           const agent = agents.get(socket.agentName);
           if (agent) agent.lastPongAt = Date.now();
+        } else if (payload.type === "STATUS" && payload.status === "WORLD_OK") {
+          console.log(`\x1b[32m[WORLD]\x1b[0m Bedrock world connection confirmed from agent "${socket.agentName}" (Session: ${payload.sessionId})`);
         }
       } else if (msg.type === "UDP_FROM_AGENT") {
         const remote = remoteBySession.get(msg.sessionId);
         if (remote) {
           touchSession(msg.sessionId);
           stats.totalUp += msg.payload.length;
-          const socketToUse = udpSockets.get(remote.localPort);
+          // FIX: Look up by publicPort instead of localPort
+          const socketToUse = udpSockets.get(remote.publicPort);
           if (socketToUse) {
             socketToUse.send(msg.payload, remote.port, remote.address);
           }
