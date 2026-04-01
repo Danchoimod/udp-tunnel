@@ -3,6 +3,7 @@
   "serverControlPort": 25284,
   "clientId": "bedrock-host-1",
   "localHost": "127.0.0.1",
-  "localUdpPort": 19132,
-  "reconnectMs": 3000
+  "localUdpPort": 7551,
+  "reconnectMs": 3000,
+  "key": ""
 }

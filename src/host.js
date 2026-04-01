@@ -176,9 +176,10 @@ function startAgent(config) {
           }
           break;
         case UDP_MSG.DATA: {
-          // Server → us: data for session parsed.id → send to local game
+          // Server → host: forward to local game via the session socket
           const sess = udpSessions.get(parsed.id);
           if (sess && parsed.payload.length > 0) {
+            // send() from the session's bound port so game replies come back here
             sess.send(parsed.payload, localPort, localHost);
           }
           break;
@@ -234,24 +235,32 @@ function startAgent(config) {
   }
 
   // ── UDP session per player (udp_open) ─────────────────────────────────
+  // Each session gets its own UDP socket bound to a random local port, then
+  // "connected" to the local game. This mirrors Go's net.DialUDP() semantics:
+  // the socket has a fixed source port so the game always knows where to respond.
 
   function handleUDPOpen(msg) {
     if (udpSessions.has(msg.id)) closeUDPSession(msg.id);
 
-    const sock = dgram.createSocket('udp4');
-    udpSessions.set(msg.id, sock);
+    const sock = dgram.createSocket({ type: 'udp4' });
 
     sock.on('message', (buf) => {
-      // Data from local game → forward to server via UDP data channel
+      // Reply from local game → forward back to server via UDP control channel
       if (!udpCtrlConn || !udpReady) return;
       udpCtrlConn.send(
         buildUDPMessage(UDP_MSG.DATA, myKey, msg.id, buf),
         serverPort, serverHost
       );
     });
+
     sock.on('error', () => closeUDPSession(msg.id));
 
-    console.log(`\x1b[34m[UDP Open]\x1b[0m Session \x1b[33m${msg.id}\x1b[0m from ${msg.remote_addr}`);
+    // Bug 3 fix: explicitly bind to port 0 so the OS assigns a real local port.
+    // Without this, dgram may not consistently receive replies from the game.
+    sock.bind(0, localHost, () => {
+      udpSessions.set(msg.id, sock);
+      console.log(`\x1b[34m[UDP Open]\x1b[0m Session \x1b[33m${msg.id}\x1b[0m from ${msg.remote_addr} → local bound :${sock.address().port}`);
+    });
   }
 
   function closeUDPSession(id) {
@@ -309,6 +318,7 @@ function startAgent(config) {
       socket.write(encodeControl({
         type:      'register',
         key:       myKey,
+        token:     config.authToken || '',   // Bug 5 fix: send auth token
         client_id: clientId,
         target:    `${localHost}:${localPort}`,
         protocol:  cliProto,

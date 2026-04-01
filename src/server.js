@@ -101,22 +101,15 @@ function startServer(config) {
 
     sock.on('message', (msg, rinfo) => {
       const remoteAddr = `${rinfo.address}:${rinfo.port}`;
-      console.log(`\x1b[33m[UDP :${publicPort}]\x1b[0m Packet from ${remoteAddr} (${msg.length}B)`);
       const client = clients.get(portMapping.clientId);
-      if (!client) {
-        console.warn(`\x1b[31m[UDP :${publicPort}]\x1b[0m No agent for client_id: ${portMapping.clientId}`);
-        return;
-      }
-      if (!client.udpConn) {
-        console.warn(`\x1b[31m[UDP :${publicPort}]\x1b[0m Agent has no UDP channel yet (handshake pending?)`);
-        return;
-      }
+      if (!client || !client.udpConn) return; // no agent or UDP channel not ready
 
-      // Find existing session for this remoteAddr+port
+      // Find existing session for this remoteAddr
       let sessionId = null;
       for (const [id, sess] of udpSessions) {
         if (sess.clientId === portMapping.clientId && sess.remoteAddr === remoteAddr) {
           sessionId = id;
+          sess.lastSeen = Date.now(); // Bug 1 fix: update lastSeen
           break;
         }
       }
@@ -124,7 +117,12 @@ function startServer(config) {
       if (!sessionId) {
         // New player → create session, notify client via control
         sessionId = crypto.randomBytes(8).toString('hex');
-        udpSessions.set(sessionId, { clientId: portMapping.clientId, remoteAddr, publicPort });
+        udpSessions.set(sessionId, {
+          clientId: portMapping.clientId,
+          remoteAddr,
+          publicPort,
+          lastSeen: Date.now(), // Bug 1 fix: track creation time
+        });
         client.socket.write(encodeControl({
           type: 'udp_open',
           id: sessionId,
@@ -134,10 +132,10 @@ function startServer(config) {
         console.log(`\x1b[35m[UDP Open]\x1b[0m Session \x1b[33m${sessionId}\x1b[0m from ${remoteAddr}`);
       }
 
-      // Forward to client via UDP data channel
+      // Forward to host via UDP data channel
       stats.totalDown += msg.length;
       const udpPkt = buildUDPMessage(UDP_MSG.DATA, client.key, sessionId, msg);
-      client.udpConn && client.udpConn.send(udpPkt, client.udpPort, client.udpAddr);
+      client.udpConn.send(udpPkt, client.udpPort, client.udpAddr);
     });
 
     sock.on('error', (err) => console.error(`[UDP :${publicPort}] Error:`, err.message));
@@ -261,6 +259,13 @@ function startServer(config) {
       if (!registered && msg.type === 'register') {
         clientId = msg.client_id || 'default';
 
+        // Bug 5 fix: optional authToken check
+        if (config.authToken && msg.token !== config.authToken) {
+          socket.write(encodeControl({ type: 'error', error: 'invalid token' }));
+          socket.destroy();
+          return;
+        }
+
         // Replace old connection for same clientId
         const old = clients.get(clientId);
         if (old) {
@@ -381,15 +386,18 @@ function startServer(config) {
         c.socket.write(encodeControl({ type: 'ping' }));
       }
     }
-    // Clean up expired UDP sessions (60s idle)
+    // Bug 1 fix: expire UDP sessions idle > 60s
+    const sessionIdleMs = config.sessionIdleTimeoutMs || 60000;
     for (const [id, sess] of udpSessions) {
-      if (!clients.has(sess.clientId)) udpSessions.delete(id);
+      const idle = !clients.has(sess.clientId) || (Date.now() - sess.lastSeen > sessionIdleMs);
+      if (idle) {
+        udpSessions.delete(id);
+        console.log(`\x1b[30m[UDP Expire]\x1b[0m Session ${id} cleaned up`);
+      }
     }
   }, pingIntervalMs);
 
-  // Dashboard (disabled temporarily for debug — re-enable after confirming tunnel works)
-  // setInterval(() => renderDashboard(config, clients, pendingTcp, udpSessions), 1000);
-  console.log('\x1b[32m[Server Ready]\x1b[0m Debug mode: watching for UDP packets...');
+  setInterval(() => renderDashboard(config, clients, pendingTcp, udpSessions), 1000);
 }
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
