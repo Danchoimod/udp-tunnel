@@ -1,78 +1,242 @@
-# Minecraft Bedrock UDP Tunnel (Node.js)
+# 🎮 Bedrock UDP Tunnel
 
-Backend tunnel UDP cho Minecraft Bedrock, lấy ý tưởng kiến trúc từ `frp`:
+> **UDP tunnel hiệu năng cao cho Minecraft Bedrock Edition**, lấy cảm hứng kiến trúc từ [frp](https://github.com/fatedier/frp) — cho phép host server Minecraft Bedrock ở mạng LAN không cần public IP.
 
-- **Tunnel Server**: chạy trên máy có public IP.
-- **Tunnel Agent**: chạy cùng mạng LAN với Bedrock server.
-- Người chơi gửi UDP tới public server, server forward qua kênh control tới agent, agent đẩy vào Bedrock local và trả ngược lại.
+![Node.js](https://img.shields.io/badge/Node.js-18%2B-green?logo=node.js)
+![License](https://img.shields.io/badge/License-ISC-blue)
+![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey)
 
-## Luong du lieu
+---
 
-1. Player -> `publicUdpPort` trên server.
-2. Server map session theo `player_ip:player_port`.
-3. Server gui goi UDP qua ket noi TCP control den agent.
-4. Agent gui den Bedrock local (`localUdpHost:localUdpPort`).
-5. Response tu Bedrock duoc agent gui nguoc lai server.
-6. Server tra lai dung player session.
+## 📖 Tổng quan
 
-## Cau truc
+Bedrock UDP Tunnel giải quyết vấn đề: **Minecraft Bedrock dùng UDP**, nhưng phần lớn người chơi không có public IP để mở server cho bạn bè vào.
 
-- `src/server.js`: tunnel backend cong khai (UDP ingress + TCP control).
-- `src/agent.js`: client agent noi bo.
-- `src/common/protocol.js`: JSON-lines protocol.
-- `configs/server.config.json`: config server mau.
-- `configs/agent.config.json`: config agent mau.
+Kiến trúc gồm hai thành phần chính:
 
-## Yeu cau
+| Thành phần | Vị trí | Vai trò |
+|---|---|---|
+| **Tunnel Server** | VPS / máy có public IP | Nhận kết nối UDP từ người chơi, relay qua kênh TCP đến Agent |
+| **Tunnel Agent (Host)** | Máy LAN chạy Bedrock server | Kết nối ra Server, nhận/gửi gói tin UDP tới Bedrock local |
 
-- Node.js 18+.
-- Mo firewall:
-  - VPS/server: UDP `publicUdpPort`, TCP `controlPort`.
-  - LAN machine: outbound TCP den `serverHost:serverControlPort`.
+```
+[Người chơi] --UDP--> [Tunnel Server (VPS)] --TCP Control--> [Tunnel Agent (LAN)]
+                                                                        |
+                                                               [Bedrock Server :19132]
+```
 
-## Cau hinh nhanh
+---
 
-1. Sua `configs/server.config.json`:
-   - `publicUdpPort`: cong public cho Minecraft BE (thuong `19132`).
-   - `controlPort`: cong control cho agent.
-   - `authToken`: token xac thuc chung.
+## ✨ Tính năng
 
-2. Sua `configs/agent.config.json`:
-   - `serverHost`: IP/domain cua tunnel server.
-   - `serverControlPort`: trung `controlPort`.
-   - `authToken`: trung voi server.
-   - `localUdpHost/localUdpPort`: Bedrock server noi bo (thuong `127.0.0.1:19132`).
+- 🔒 **Xác thực `authToken`** — chặn agent lạ kết nối vào server
+- 🔄 **Tự động reconnect** — agent tự kết nối lại khi mất kết nối
+- 🗺️ **Multi-client** — một server có thể phục vụ nhiều Bedrock host song song
+- 📡 **Dynamic NAT support** — cập nhật địa chỉ UDP agent tự động
+- 💓 **Heartbeat ping/pong** — phát hiện và dọn dẹp kết nối chết
+- 🧹 **UDP session idle timeout** — tự dọn session không hoạt động sau 60 giây
+- 📊 **Live Dashboard** — hiển thị trạng thái, traffic, uptime trên terminal
+- 🔌 **TCP tunnel** — hỗ trợ thêm tunnel TCP nếu cần (tùy chọn)
 
-## Chay
+---
 
-### Tren public server
+## 🗂️ Cấu trúc dự án
+
+```
+udp-tunnel/
+├── src/
+│   ├── server.js          # Tunnel Server — chạy trên VPS
+│   ├── host.js            # Tunnel Agent — chạy trên máy LAN
+│   ├── client.js          # Simple UDP proxy client (chế độ client đơn giản)
+│   └── common/
+│       └── protocol.js    # Giao thức nhị phân UDP + JSON-lines TCP
+├── configs/
+│   ├── server.config.json # Cấu hình Server mẫu
+│   ├── agent.config.json  # Cấu hình Agent mẫu
+│   └── client.config.json # Cấu hình Client mẫu
+├── index.js               # Entry point (launcher)
+└── package.json
+```
+
+---
+
+## ⚙️ Yêu cầu
+
+- **Node.js 18+**
+- Firewall cần mở:
+  - **VPS/Server**: UDP + TCP port `controlPort` (mặc định `25284`), UDP `publicPort` của từng Bedrock host
+  - **Máy LAN**: outbound TCP đến `serverHost:serverControlPort`
+
+---
+
+## 🚀 Cài đặt & Chạy nhanh
+
+### 1. Clone và cài đặt
+
+```bash
+git clone https://github.com/Danchoimod/udp-tunnel.git
+cd udp-tunnel
+npm install
+```
+
+### 2. Cấu hình Server (trên VPS)
+
+Chỉnh `configs/server.config.json`:
+
+```json
+{
+  "publicBindAddr": "0.0.0.0",
+  "controlBindAddr": "0.0.0.0",
+  "controlPort": 25284,
+  "pingIntervalMs": 20000,
+  "pongTimeoutMs": 45000,
+  "authToken": "THAY_BANG_TOKEN_MANH",
+  "ports": [
+    {
+      "publicPort": 25294,
+      "clientId": "bedrock-host-1",
+      "protocol": "udp"
+    },
+    {
+      "publicPort": 25296,
+      "clientId": "bedrock-host-2",
+      "protocol": "udp"
+    }
+  ]
+}
+```
+
+| Trường | Mô tả |
+|---|---|
+| `controlPort` | Port TCP để Agent kết nối vào |
+| `authToken` | Token xác thực (giống nhau ở Server và Agent) |
+| `ports[].publicPort` | Port UDP mà người chơi kết nối vào |
+| `ports[].clientId` | ID định danh Agent |
+
+### 3. Cấu hình Agent (trên máy LAN)
+
+Chỉnh `configs/agent.config.json`:
+
+```json
+{
+  "serverHost": "your-vps-ip-or-domain",
+  "serverControlPort": 25284,
+  "clientId": "bedrock-host-1",
+  "localHost": "127.0.0.1",
+  "localUdpPort": 19132,
+  "reconnectMs": 3000,
+  "authToken": "THAY_BANG_TOKEN_MANH",
+  "key": ""
+}
+```
+
+| Trường | Mô tả |
+|---|---|
+| `serverHost` | IP hoặc domain của VPS chạy Server |
+| `serverControlPort` | Phải trùng với `controlPort` của Server |
+| `clientId` | Phải trùng với `clientId` trong cấu hình Server |
+| `localUdpPort` | Port UDP của Bedrock server local (thường `19132`) |
+| `authToken` | Phải trùng với Server |
+
+### 4. Khởi động
+
+**Trên VPS (Tunnel Server):**
 
 ```bash
 npm run start:server
 ```
 
-### Tren may LAN co Bedrock server
+**Trên máy LAN (Tunnel Agent):**
 
 ```bash
 npm run start:agent
 ```
 
-Nguoi choi ket noi den:
+**Người chơi kết nối vào:**
+- Host: `<IP/domain VPS>`
+- Port: `25294` (hoặc port bạn đã cấu hình)
 
-- Host: IP/domain public server
-- Port: `publicUdpPort` (vd `19132`)
+---
 
-## Ghi chu bao mat va van hanh
+## 📊 Terminal Dashboard
 
-- Doi `authToken` manh va khong commit token that.
-- Dat tunnel server sau firewall, chi mo port can thiet.
-- Day la UDP tunnel can ban, chua co:
-  - ma hoa end-to-end packet payload,
-  - dashboard/metrics,
-  - multi-agent load balancing.
+Sau khi khởi động, Server và Agent đều hiển thị dashboard live:
 
-## Lien he voi frp
+```
+══════════════════════════════════════════════════════════════
+         BEDROCK TUNNEL SERVER  (LFLauncher)
+══════════════════════════════════════════════════════════════
+ Uptime      : 0h 5m 12s
+ Clients     : 1
+ Pending TCP : 0
+ UDP sessions: 3
+──────────────────────────────────────────────────────────────
+ [UDP :25294] ← client_id: bedrock-host-1  ONLINE
+ [UDP :25296] ← client_id: bedrock-host-2  WAITING
+──────────────────────────────────────────────────────────────
+ ▲ Total Up  : 1.24 MB
+ ▼ Total Down: 3.57 MB
+══════════════════════════════════════════════════════════════
+```
 
-Project nay hoc theo mo hinh frp (server-client, auth, mapping session, keepalive), nhung duoc toi gian hoa de phuc vu rieng Minecraft Bedrock UDP.
+---
 
-- frp repo: [fatedier/frp](https://github.com/fatedier/frp)
+## 🔌 Giao thức kỹ thuật
+
+### Kênh Control (TCP — JSON-lines)
+
+```
+Agent  → Server:  { "type": "register", "key": "", "client_id": "...", "token": "...", "protocol": "udp" }
+Server → Agent:   { "type": "registered", "key": "<hex>", "remote_port": 25294 }
+Server → Agent:   { "type": "udp_open", "id": "<session_id>", "remote_addr": "1.2.3.4:5678" }
+Server → Agent:   { "type": "udp_close", "id": "<session_id>" }
+Both:             { "type": "ping" } / { "type": "pong" }
+```
+
+### Kênh UDP Data (Binary)
+
+```
+[msgType 1B][keyLen 2B BE][key bytes][idLen 2B BE][id bytes][payload]
+```
+
+| msgType | Ý nghĩa |
+|---|---|
+| `1` | HANDSHAKE |
+| `2` | DATA |
+| `3` | CLOSE |
+| `4` | PING |
+| `5` | PONG |
+
+---
+
+## 🔒 Bảo mật & Vận hành
+
+- **Đổi `authToken`** thành chuỗi mạnh, ngẫu nhiên — không commit token thật lên git
+- **Mở đúng port firewall**: chỉ mở những port cần thiết trên VPS
+- Tunnel này **chưa có** mã hóa end-to-end cho payload UDP — không nên dùng để truyền dữ liệu nhạy cảm
+- Nếu cần chạy liên tục, dùng **PM2** hoặc **systemd**:
+
+```bash
+# PM2
+npm install -g pm2
+pm2 start "npm run start:server" --name bedrock-tunnel-server
+pm2 start "npm run start:agent"  --name bedrock-tunnel-agent
+pm2 save
+```
+
+---
+
+## 📜 Scripts
+
+| Lệnh | Mô tả |
+|---|---|
+| `npm run start:server` | Khởi động Tunnel Server |
+| `npm run start:agent` | Khởi động Tunnel Agent |
+| `npm run start:client` | Khởi động UDP proxy client đơn giản |
+
+---
+
+## 🙏 Credits
+
+Lấy cảm hứng kiến trúc (server-client, auth, session mapping, keepalive) từ:
+- [fatedier/frp](https://github.com/fatedier/frp) — Fast Reverse Proxy
